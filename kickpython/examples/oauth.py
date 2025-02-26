@@ -4,7 +4,7 @@ import sys
 import logging
 import sqlite3
 import time
-from kickpy import KickAPI
+from kickphyton import KickAPI
 from flask import Flask, request, redirect, session
 
 logging.basicConfig(level=logging.INFO)

@@ -1,6 +1,6 @@
 import asyncio
 import sqlite3
-from kickpy import KickAPI
+from kickphyton import KickAPI
 import logging
 import os
 from dotenv import load_dotenv
