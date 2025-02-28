@@ -264,6 +264,8 @@ class KickAPI:
             # Get channel_id if not provided
             if not channel_id:
                 channel_id = await self.get_broadcaster_id(token_data["access_token"])
+                token_data["channel_id"] = channel_id
+
                 if not channel_id:
                     logger.error("Could not determine broadcaster ID from token")
                     return None
@@ -276,6 +278,11 @@ class KickAPI:
                 token_data["expires_in"],
                 token_data["scope"]
             )
+            try:
+                channel_name = await self.fetch_channel_username(channel_id)
+                await self.get_chatroom_id(channel_name)
+            except Exception as e:
+                logger.error(f"Failed to fetch channel info: {e}")
             
             return token_data
     
