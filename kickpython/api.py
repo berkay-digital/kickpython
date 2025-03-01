@@ -770,6 +770,7 @@ class KickAPI:
                 for (channel_id,) in channels:
                     try:
                         await self.refresh_token(channel_id)
+                        logger.info(f"Refreshed token for channel {channel_id}")
                     except Exception as e:
                         logger.error(f"Failed to refresh token for channel {channel_id}: {e}")
 
