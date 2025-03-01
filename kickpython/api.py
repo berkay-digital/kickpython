@@ -21,7 +21,8 @@ class KickAPI:
                  base_url="https://api.kick.com/public/v1", 
                  oauth_base_url="https://id.kick.com",
                  db_path="kick_tokens.db", 
-                 proxy=None, proxy_auth=None, **kwargs):
+                 proxy=None, proxy_auth=None,
+                  token_refresh_interval=3600, **kwargs):
         self.base_url = base_url
         self.oauth_base_url = oauth_base_url
         self.client_id = client_id
@@ -35,7 +36,7 @@ class KickAPI:
         self.message_handlers = []
         self.session = None
         self.refresh_task = None
-        self._refresh_interval = 3600  # Refresh tokens every hour
+        self._refresh_interval = token_refresh_interval  # Refresh tokens every hour
         self._should_refresh = False
         
         # Initialize database if needed
