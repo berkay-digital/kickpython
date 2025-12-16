@@ -1,4 +1,4 @@
-aiohttp==3.11.13
+aiohttp==3.12.14
 websockets==15.0
 asyncio==3.4.3
 python-dotenv==1.0.1
