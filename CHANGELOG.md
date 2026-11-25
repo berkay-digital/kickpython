@@ -12,8 +12,8 @@ A rewrite against the current Kick API. Not compatible with 0.x; see [docs/migra
 - Clear errors for missing scopes: on a 401, the client introspects the token and reports its scopes instead of refreshing a valid token.
 - Token stores: memory, JSON file, SQLite (reads 0.x databases), or your own.
 - Typed pydantic models for every response and webhook payload, with `Page` cursor pagination.
-- `WebhookHandler`: RSA signature checks with key rotation, timestamp and duplicate checks, typed events, and an aiohttp route.
-- `LiveChat`: a websocket chat reader for many channels over one connection, with reconnects and ping handling. It looks up Kick's current Pusher key at runtime.
+- `WebhookHandler`: RSA signature checks with rate-limited key refetching for rotation, timestamp and duplicate checks, an optional broadcaster allowlist, typed events, and an aiohttp route.
+- `LiveChat`: a websocket chat reader for many channels over one connection, with reconnects and ping handling. It looks up Kick's current Pusher key at runtime. Handlers run in order in their own task, so a slow handler never stalls the connection.
 - Retries for 429 (with `Retry-After`) and failed GET requests.
 - The 127.0.0.1 redirect URI workaround from Kick's docs.
 - Tests against a fake Kick server, opt-in live tests, CI on Python 3.10 to 3.14.
