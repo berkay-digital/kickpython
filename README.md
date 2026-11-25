@@ -1,177 +1,198 @@
-# KickPython - Python API Wrapper
+# kickpython
 
-A Python wrapper for the Kick.com API that provides easy access to Kick.com's public API endpoints and WebSocket chat functionality.
+Async Python client for the [Kick.com public API](https://docs.kick.com).
 
-## Installation
+- OAuth 2.1 with PKCE, app tokens and user tokens. Tokens refresh on their own and persist in memory, a JSON file, SQLite or your own store.
+- Every endpoint in Kick's API: users, channels, chat, moderation, channel rewards, livestreams, categories, event subscriptions, KICKs, ads and drops.
+- Typed responses (pydantic models), cursor pagination, automatic retries on rate limits.
+- Webhook receiver with signature checks, replay protection and typed event payloads.
+- A websocket chat reader for bots that can't expose a public webhook URL (unofficial, see below).
 
 ```bash
 pip install kickpython
 ```
 
-## Features
+Python 3.10 or newer.
 
-- OAuth 2.1 authentication with PKCE support
-- Automatic token storage and refresh
-- Channel management
-- Chat message sending and receiving
-- WebSocket-based chat listener
-- Support for channel category management
-- Proxy support
+## Quick start
 
-## Usage
-
-### Basic Initialization
+Create an app at [kick.com/settings/developer](https://kick.com/settings/developer) to get a client ID and secret.
 
 ```python
-from kickpython import KickAPI
+import asyncio
+from kickpython import KickClient
 
-# For OAuth 2.1 authentication (recommended)
-api = KickAPI(
-    client_id="your_client_id",
-    client_secret="your_client_secret",
-    redirect_uri="your_redirect_uri",
-    db_path="kick_tokens.db"  # Optional, defaults to kick_tokens.db
+async def main():
+    async with KickClient("CLIENT_ID", "CLIENT_SECRET") as kick:
+        channel = await kick.channels.get_by_slug("berkaydigital")
+        print(channel.slug, channel.is_live, channel.stream_title)
+
+        page = await kick.livestreams.list(language_codes=["en"], limit=10)
+        for stream in page:
+            print(stream.slug, stream.viewer_count)
+
+asyncio.run(main())
+```
+
+Without a user, requests use an app access token. The client fetches it with your client credentials and renews it when it expires.
+
+## Acting as a user
+
+Sending chat, editing a channel, moderating and managing rewards need a user's permission. Send the user through the OAuth flow once, then save their tokens:
+
+```python
+from kickpython import KickClient, Scope, SQLiteTokenStore
+
+kick = KickClient("CLIENT_ID", "CLIENT_SECRET", token_store=SQLiteTokenStore("kick_tokens.db"))
+
+# 1. Send the user to request.url. Keep state and code_verifier for step 2.
+request = kick.authorization_url(
+    "http://localhost:9765/callback",
+    [Scope.USER_READ, Scope.CHAT_WRITE, Scope.CHANNEL_WRITE],
 )
 
-# With proxy support
-api = KickAPI(
-    client_id="your_client_id",
-    client_secret="your_client_secret",
-    redirect_uri="your_redirect_uri",
-    proxy="proxy.example.com:8080",
-    proxy_auth="username:password"
-)
+# 2. Kick redirects back with ?code=...&state=... Check the state, then:
+token = await kick.exchange_code(code, code_verifier=request.code_verifier,
+                                 redirect_uri=request.redirect_uri)
+
+# 3. From now on, act as that user. Expired tokens refresh themselves.
+me = kick.as_user(token.user_id)
+await me.chat.send("Hello chat!")
+await me.channels.update(stream_title="Building a bot")
 ```
 
-### OAuth Authentication
+[`examples/authorize.py`](https://github.com/berkay-digital/kickpython/blob/main/examples/authorize.py) does steps 1 and 2 for you from the command line.
+
+Kick only grants the scopes you enabled for the app in its settings, even if you request more. Check `token.scopes` after the exchange. When a call fails because of a missing scope, the error says so and lists the scopes the token has.
+
+More in [docs/authentication.md](https://github.com/berkay-digital/kickpython/blob/main/docs/authentication.md).
+
+## Chat
 
 ```python
-# Generate authorization URL with PKCE
-auth_data = api.get_auth_url([
-    "user:read",
-    "channel:read",
-    "channel:write",
-    "chat:write",
-    "events:subscribe"
-])
+me = kick.as_user(user_id)
 
-# The auth URL for user authorization
-auth_url = auth_data["auth_url"]
-code_verifier = auth_data["code_verifier"]
-state = auth_data["state"]
-
-# After user authorization, exchange the code for tokens
-token_data = await api.exchange_code(code, code_verifier)
-
-# Tokens are automatically stored and managed
-await api.start_token_refresh()  # Start automatic token refresh
+await me.chat.send("posted by your app's bot account")
+await me.chat.send("posted as the user", sender="user")
+await me.chat.reply(message_id, "a threaded reply")
+await me.chat.delete(message_id)                 # moderation:chat_message:manage
 ```
 
-### Chat Functionality
+With `sender="bot"` (the default) the message goes to the chat of the user whose token you use. It appears under your app's bot account.
 
-#### Sending Messages
+## Moderation, rewards and more
 
 ```python
-# Send a chat message
-await api.post_chat(
-    channel_id="123",
-    content="Hello from the bot!"
-)
+await me.moderation.timeout(user_id, minutes=10, reason="spam")
+await me.moderation.ban(user_id)
+await me.moderation.unban(user_id)
+
+reward = await me.rewards.create("Hydrate", cost=500, is_user_input_required=False)
+pending = await me.rewards.redemptions(status="pending")
+failed = await me.rewards.accept(r.id for group in pending for r in group.redemptions)
+
+board = await me.kicks.leaderboard(top=10)
+await me.ads.start_break(60)
 ```
 
-#### Listening to Chat Messages
+The full list of methods is in [docs/api.md](https://github.com/berkay-digital/kickpython/blob/main/docs/api.md).
+
+## Pagination
+
+Paginated endpoints return a `Page`. Iterate it, ask for the next one, or walk all of them:
 
 ```python
-# Define a message handler
-async def message_handler(message):
-    username = message['sender_username']
-    content = message['content']
-    badges = message['badges']
-    chat_id = message['chat_id']
-    print(f"{username}: {content}")
+page = await kick.categories.list(names=["just"])
+print([c.name for c in page])
 
-# Add the message handler
-api.add_message_handler(message_handler)
+next_page = await page.next()          # None on the last page
 
-# Connect to a channel's chat
-await api.connect_to_chatroom("channel_username")
-# Or connect using chatroom ID
-await api.connect_to_chatroom("123456")
+async for stream in (await kick.livestreams.list(limit=100)).iter_all(max_pages=5):
+    ...
 ```
 
-### Channel Management
+## Webhooks
+
+Kick sends events (chat messages, follows, subs, gifts, bans, stream start and stop, reward redemptions) to the webhook URL in your app settings. `WebhookHandler` checks each request's RSA signature against Kick's public key, rejects old or replayed deliveries and parses the payload:
 
 ```python
-# Get channel information
-channels = await api.get_channels()
+from kickpython import EventType, KickClient, WebhookEvent, WebhookHandler
 
-# Update channel information
-await api.update_channel(
-    channel_id="123",
-    category_id="456",
-    stream_title="New Stream Title"
-)
+kick = KickClient("CLIENT_ID", "CLIENT_SECRET")
+hook = WebhookHandler(client=kick)
+
+@hook.on(EventType.CHAT_MESSAGE_SENT)
+async def on_chat(event: WebhookEvent):
+    msg = event.payload                    # kickpython.ChatMessage
+    print(msg.sender.username, msg.content)
+
+# Subscribe a channel (with that user's token, or an app token plus broadcaster_user_id)
+await kick.as_user(user_id).events.subscribe([EventType.CHAT_MESSAGE_SENT])
+
+# Serve it with aiohttp, or call `await hook.handle(headers, body)` from any framework
+app = hook.aiohttp_app("/kick/webhook")
 ```
 
-### Category Management
+See [docs/webhooks.md](https://github.com/berkay-digital/kickpython/blob/main/docs/webhooks.md) and [`examples/webhook_bot.py`](https://github.com/berkay-digital/kickpython/blob/main/examples/webhook_bot.py).
+
+## Live chat without webhooks (unofficial)
+
+Webhooks need a public HTTPS endpoint. For local bots, `LiveChat` reads chat from the same websocket feed the kick.com website uses. It needs no credentials and no public URL. Answer through the official API:
 
 ```python
-# Get list of categories
-categories = await api.get_categories()
+from kickpython import KickClient, LiveChat, LiveChatMessage, SQLiteTokenStore
 
-# Search for specific categories
-results = await api.get_categories(query="games")
+kick = KickClient("CLIENT_ID", "CLIENT_SECRET", token_store=SQLiteTokenStore("kick_tokens.db"))
+live = LiveChat()
 
-# Get specific category
-category = await api.get_category(category_id="123")
+@live.on_message
+async def on_message(msg: LiveChatMessage):
+    if msg.content == "!ping":
+        await kick.as_user(msg.broadcaster_user_id).chat.reply(msg.id, "pong")
+
+await live.join("berkaydigital")
+await live.run()          # reconnects on its own
 ```
 
-## Complete Examples
+This feed is not part of Kick's public API, and Kick has changed it before. kickpython looks up the current connection details from Kick at startup to cope with that, but it can still break. Use webhooks for anything that must not miss messages. Details in [docs/live-chat.md](https://github.com/berkay-digital/kickpython/blob/main/docs/live-chat.md).
 
-### OAuth Web Server
+## Errors
 
-See [examples/oauth.py](kickpython/examples/oauth.py) for a complete Flask-based OAuth implementation that includes:
-- OAuth authorization flow with PKCE
-- Token management interface
-- Token refresh and revocation
-- Example API usage
+All errors subclass `kickpython.KickError`. API errors are `KickAPIError` with `status`, `message` and `data`, and there is a subclass per status: `BadRequestError`, `UnauthorizedError`, `ForbiddenError`, `NotFoundError`, `ConflictError`, `RateLimitError` (with `retry_after`) and `ServerError`. `MissingTokenError` means there is no usable token for the call, for example when the user never authorized your app or their refresh token expired.
 
-### Chat Bot
-
-See [examples/listen_all_channels.py](kickpython/examples/listen_all_channels.py) for a chat bot example that:
-- Connects to multiple channels
-- Handles chat messages
-- Responds to commands
-- Handles reconnection
-
-## Error Handling
-
-The API methods throw exceptions for error conditions:
-- `ValueError` for invalid input parameters
-- `Exception` for API errors with error messages
-
-Example:
 ```python
+from kickpython import BadRequestError
+
 try:
-    await api.post_chat(channel_id="123", content="")
-except ValueError as e:
-    print("Invalid parameters:", e)
-except Exception as e:
-    print("API error:", e)
+    await me.ads.start_break(30)
+except BadRequestError as exc:
+    print(exc.data)          # e.g. "CHANNEL_IS_NOT_LIVE"
 ```
 
-## Available Scopes
+The client retries 429 responses (honoring `Retry-After`) and failed GET requests up to `max_retries` times.
 
-- `user:read` - Access user information
-- `channel:read` - Access channel information
-- `channel:write` - Update channel metadata
-- `chat:write` - Send chat messages
-- `events:subscribe` - Subscribe to channel events
+## Logging
 
-## Contributing
+kickpython logs to the `kickpython` logger and never configures logging itself. Tokens never appear in logs or in `repr()`.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+## Upgrading from 0.x
+
+1.0 is a rewrite with a new API. See [docs/migrating.md](https://github.com/berkay-digital/kickpython/blob/main/docs/migrating.md). Existing `kick_tokens.db` files work with `SQLiteTokenStore`.
+
+## Development
+
+```bash
+uv sync
+uv run pytest                 # offline tests against a fake Kick server
+uv run ruff check . && uv run mypy
+KICK_CLIENT_ID=... KICK_CLIENT_SECRET=... uv run pytest -m live   # read-only checks against Kick
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT
