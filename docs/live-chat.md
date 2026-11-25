@@ -22,7 +22,7 @@ You can also join or leave channels while `run()` is going.
 
 Handlers run one at a time, in the order events arrive, in a task separate from the websocket. A slow handler delays the handlers after it but never the connection's pings. If handlers fall more than 10,000 events behind, new events are dropped with a warning.
 
-`stop()` returns `run()` promptly, even mid-reconnect, and ends any `messages()` loops. With `reconnect=False`, `run()` raises `RealtimeError` when the connection fails instead of retrying.
+`stop()` returns `run()` promptly, even mid-reconnect, and ends any `messages()` loops. Calling `stop()` before `run()` has started makes `run()` return at once. After `run()` returns you can call it again. With `reconnect=False`, `run()` raises `RealtimeError` when the connection fails instead of retrying.
 
 To consume messages in a loop instead of a callback, start `run()` in a task and iterate. The loop ends when `run()` returns:
 

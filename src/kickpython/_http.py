@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import email.utils
+import functools
 import json as jsonlib
 import logging
 import random
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -96,6 +98,10 @@ class Transport:
         self._app_token: Token | None = None
         self._app_lock = asyncio.Lock()
         self._user_locks: dict[int, asyncio.Lock] = {}
+        # One in-flight refresh per user. It survives a cancelled caller, and
+        # the next caller for that user joins it instead of reusing the old
+        # (now dead) refresh token.
+        self._refreshing: dict[int, asyncio.Task[Token]] = {}
 
     # Session --------------------------------------------------------------
 
@@ -180,13 +186,37 @@ class Transport:
         """Refresh ``token`` and save the result.
 
         Kick rotates the refresh token, so once the request is sent the old
-        pair is dead. The exchange and the save run shielded from
-        cancellation, so a timeout or shutdown can't drop the new pair.
+        pair is dead. The exchange and the save run in their own task: if the
+        caller is cancelled (a timeout, say) the task still finishes and saves
+        the new pair, and the next request for this user waits for it.
         """
         self.require_credentials()
         if not token.refresh_token:
             raise MissingTokenError(f"token for user {token.user_id} has no refresh token")
-        return await asyncio.shield(self._refresh_and_save(token))
+        assert token.user_id is not None
+        uid = token.user_id
+        task = self._refreshing.get(uid)
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._refresh_and_save(token))
+            self._refreshing[uid] = task
+            task.add_done_callback(functools.partial(self._forget_refresh, uid))
+        return await asyncio.shield(task)
+
+    def _forget_refresh(self, user_id: int, task: asyncio.Task[Token]) -> None:
+        if self._refreshing.get(user_id) is task:
+            del self._refreshing[user_id]
+        if not task.cancelled():
+            task.exception()  # mark retrieved; callers already got it
+
+    @contextlib.asynccontextmanager
+    async def exclusive_user(self, user_id: int) -> AsyncIterator[None]:
+        """Hold a user's token lock with no refresh in flight."""
+        async with self._lock_for(user_id):
+            pending = self._refreshing.get(user_id)
+            if pending is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(pending)
+            yield
 
     async def _refresh_and_save(self, token: Token) -> Token:
         client_id, secret = self.require_credentials()
@@ -243,6 +273,11 @@ class Transport:
         self, user_id: int, *, force: bool = False, failed: str | None = None
     ) -> Token:
         async with self._lock_for(user_id):
+            pending = self._refreshing.get(user_id)
+            if pending is not None:
+                # A refresh from a cancelled caller is still running: use its result.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(pending)
             tok = await self.store.get(user_id)
             if tok is None:
                 raise MissingTokenError(
@@ -271,11 +306,8 @@ class Transport:
         if auth == "none":
             return None, "none"
         if auth in ("user", "any") and user_id is not None:
-            try:
-                return (await self.user_token(user_id)).access_token, "user"
-            except MissingTokenError:
-                if not self.static_token:
-                    raise
+            # A bound user always means that user's stored token, never the fixed one.
+            return (await self.user_token(user_id)).access_token, "user"
         if self.static_token:
             return self.static_token, "static"
         if auth == "user":

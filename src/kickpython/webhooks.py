@@ -39,7 +39,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from .errors import WebhookVerificationError
+from .errors import KickError, WebhookVerificationError
 from .events import WebhookEvent, payload_model
 from .scopes import EventType
 
@@ -56,6 +56,7 @@ __all__ = [
     "HEADER_SUBSCRIPTION_ID",
     "HEADER_TIMESTAMP",
     "WebhookHandler",
+    "WebhookKeyUnavailable",
     "parse_event",
     "verify_signature",
 ]
@@ -70,6 +71,12 @@ HEADER_EVENT_TYPE = "Kick-Event-Type"
 HEADER_EVENT_VERSION = "Kick-Event-Version"
 PUBLIC_KEY_URL = "https://api.kick.com/public/v1/public-key"
 KEY_FETCH_TIMEOUT = 10.0
+KEY_FAILURE_COOLDOWN = 15.0  # after a failed fetch, fail fast for this long
+
+
+class WebhookKeyUnavailable(KickError):
+    """Kick's public key couldn't be fetched, so deliveries can't be verified yet."""
+
 
 Handler = Callable[[WebhookEvent], Awaitable[None] | None]
 H = TypeVar("H", bound=Handler)
@@ -215,6 +222,8 @@ class WebhookHandler:
         )
         self.max_age = max_age
         self._seen: OrderedDict[str, float] = OrderedDict()
+        self._inflight: set[str] = set()
+        self._fetch_failed_at = float("-inf")
         self._dedupe_limit = dedupe_limit
         self._handlers: dict[str, list[Handler]] = {}
         self._catch_all: list[Handler] = []
@@ -263,9 +272,19 @@ class WebhookHandler:
         key = self._key
         if key is not None:
             return key
+        if time.monotonic() - self._fetch_failed_at < KEY_FAILURE_COOLDOWN:
+            raise WebhookKeyUnavailable("Kick's public key is unavailable; retry shortly")
         async with self._key_lock:
             if self._key is None:
-                self._key = await self._fetch_key()
+                if time.monotonic() - self._fetch_failed_at < KEY_FAILURE_COOLDOWN:
+                    raise WebhookKeyUnavailable("Kick's public key is unavailable; retry shortly")
+                try:
+                    self._key = await self._fetch_key()
+                except Exception as exc:
+                    self._fetch_failed_at = time.monotonic()
+                    raise WebhookKeyUnavailable(
+                        f"could not fetch Kick's public key: {exc}"
+                    ) from exc
                 self._last_fetch = time.monotonic()
             return self._key
 
@@ -294,8 +313,8 @@ class WebhookHandler:
     async def verify(self, headers: Mapping[str, str], body: bytes) -> None:
         """Raise :class:`WebhookVerificationError` unless the delivery is genuine and fresh.
 
-        May raise other exceptions (network errors) if the public key can't
-        be fetched at all; answer those with HTTP 5xx so Kick retries.
+        Raises :class:`WebhookKeyUnavailable` if Kick's public key can't be
+        fetched; answer that with HTTP 503 so Kick retries later.
         """
         message_id = _header(headers, HEADER_MESSAGE_ID)
         timestamp = _header(headers, HEADER_TIMESTAMP)
@@ -328,7 +347,7 @@ class WebhookHandler:
             raise WebhookVerificationError(f"event is for broadcaster {uid}, not one of yours")
 
     def _seen_before(self, message_id: str) -> bool:
-        return message_id in self._seen
+        return message_id in self._seen or message_id in self._inflight
 
     def _remember(self, message_id: str) -> None:
         now = time.monotonic()
@@ -369,8 +388,14 @@ class WebhookHandler:
         event = await self.accept(headers, body)
         if event is None:
             return None
-        await self.dispatch(event)
-        self._remember(event.message_id)
+        # Reserve the ID before awaiting handlers, so a concurrent retry of the
+        # same delivery is dropped. Released if a handler raises.
+        self._inflight.add(event.message_id)
+        try:
+            await self.dispatch(event)
+            self._remember(event.message_id)
+        finally:
+            self._inflight.discard(event.message_id)
         return event
 
     async def dispatch(self, event: WebhookEvent) -> None:
@@ -391,8 +416,8 @@ class WebhookHandler:
         except WebhookVerificationError as exc:
             log.warning("rejected webhook from %s: %s", request.remote, exc)
             return web.Response(status=401, text="rejected")
-        except Exception:
-            log.exception("could not verify webhook (public key unavailable?)")
+        except WebhookKeyUnavailable as exc:
+            log.warning("could not verify webhook: %s", exc)
             return web.Response(status=503, text="try again")
         if event is not None:
             self._remember(event.message_id)

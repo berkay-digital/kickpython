@@ -90,6 +90,8 @@ If the refresh itself fails (the user revoked access, or the refresh token expir
 | `JSONFileTokenStore(path)` | One process, simple setup. Writes the file atomically with mode 0600 |
 | `SQLiteTokenStore(path)` | One or a few processes on one machine. Reads kickpython 0.x `kick_tokens.db` files |
 
+`SQLiteTokenStore` creates its file readable by the owner only, and tightens an existing file (such as a 0.x `kick_tokens.db`) to the same.
+
 To use Redis, Postgres or anything else, write a class with these four async methods:
 
 ```python
@@ -110,7 +112,7 @@ await kick.refresh_all_user_tokens()          # refresh every stored user; retur
 await kick.get_user_token(user_id)            # valid token, refreshed if needed
 await kick.add_user_token(token)              # import a token you got elsewhere
 info = await kick.as_user(user_id).introspect()
-await kick.revoke_user(user_id)               # revoke at Kick and delete from the store
+await kick.revoke_user(user_id)               # revoke at Kick, then delete; keeps the token if Kick refuses
 await kick.revoke_token(raw_token, hint="access_token")
 ```
 
@@ -124,4 +126,4 @@ For quick scripts you can skip all of this:
 kick = KickClient(access_token="...")
 ```
 
-That token is used for every request and never refreshed.
+That token is used for every request and never refreshed. `kick.as_user(user_id)` still means that user's stored token: if there is none, you get `MissingTokenError`, never the fixed token.

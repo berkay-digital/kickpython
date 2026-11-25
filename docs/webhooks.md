@@ -54,6 +54,8 @@ async def kick_webhook(request: Request):
         await hook.handle(request.headers, await request.body())
     except WebhookVerificationError:
         raise HTTPException(401)
+    except WebhookKeyUnavailable:
+        raise HTTPException(503)
     return "ok"
 ```
 
@@ -63,7 +65,7 @@ async def kick_webhook(request: Request):
 
 - **Signature.** Kick signs `"{Kick-Event-Message-Id}.{Kick-Event-Message-Timestamp}.{body}"` with RSA (PKCS#1 v1.5, SHA-256). The handler fetches Kick's public key from `GET /public/v1/public-key` with a 10 second timeout. When a signature fails it fetches the key again in case Kick rotated it, but at most once every `key_refresh_interval` seconds (default 300). That stops forged requests from turning into a flood of key fetches. Pass `public_key=` to pin a key and never fetch.
 - **Age.** Deliveries whose timestamp is more than `max_age` seconds (default 600) from now are rejected. Set `max_age=None` to turn this off.
-- **Duplicates.** Kick may deliver the same message twice. The handler remembers message IDs for twice `max_age`, so a replay inside the accepted window is dropped. This memory is per process. With `handle()`, an ID is only remembered after your handlers succeed, so if one raises, Kick's retry runs them again.
+- **Duplicates.** Kick may deliver the same message twice. The handler remembers message IDs for twice `max_age`, so a replay inside the accepted window is dropped. This memory is per process. With `handle()`, a delivery that is still being handled also counts as seen, and an ID is only kept after your handlers succeed, so if one raises, Kick's retry runs them again.
 - **Broadcaster.** Optional. With `broadcaster_user_ids=[...]`, deliveries for any other channel are rejected.
 
 ### What the signature doesn't cover
@@ -76,7 +78,7 @@ So:
 - Check fields in the payload, such as `msg.broadcaster.user_id`, before you hand out rewards.
 - Keep handlers idempotent.
 
-If the public key can't be fetched at all, `verify` raises the network error rather than `WebhookVerificationError`. The aiohttp route answers 503 in that case so Kick retries later.
+If the public key can't be fetched at all, `verify` raises `WebhookKeyUnavailable` instead of `WebhookVerificationError`. Answer it with 503 so Kick retries later; the aiohttp route does. After a failed fetch the handler fails fast for 15 seconds instead of fetching again on every request.
 
 ## Event types
 

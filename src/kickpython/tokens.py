@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -219,6 +220,19 @@ class JSONFileTokenStore:
         return [int(k) for k in data]
 
 
+def _private_file(path: str) -> None:
+    """Make sure ``path`` exists and only its owner can read it."""
+    if os.path.exists(path):
+        if os.name == "posix" and os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+            logging.getLogger("kickpython").info("restricted %s to owner-only access", path)
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    with contextlib.suppress(FileExistsError):  # created concurrently: fine
+        os.close(os.open(path, flags, 0o600))
+
+
 class SQLiteTokenStore:
     """Stores tokens in SQLite.
 
@@ -242,10 +256,8 @@ class SQLiteTokenStore:
         if self._memory is not None:
             conn = self._memory
         else:
-            if not self._ready and not os.path.exists(self.path):
-                Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-                # Create the file owner-only before SQLite does, so tokens aren't world readable.
-                os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
+            if not self._ready:
+                _private_file(self.path)
             conn = sqlite3.connect(self.path)
         if not self._ready:
             conn.execute(

@@ -58,7 +58,7 @@ from .oauth import AuthorizationRequest, build_authorization_url
 from .realtime import ChannelRef, LiveChat, LiveChatMessage, RealtimeError
 from .scopes import EventType, Scope
 from .tokens import JSONFileTokenStore, MemoryTokenStore, SQLiteTokenStore, Token, TokenStore
-from .webhooks import WebhookHandler, parse_event, verify_signature
+from .webhooks import WebhookHandler, WebhookKeyUnavailable, parse_event, verify_signature
 
 __all__ = [
     "AdBreak",
@@ -116,6 +116,7 @@ __all__ = [
     "User",
     "WebhookEvent",
     "WebhookHandler",
+    "WebhookKeyUnavailable",
     "WebhookVerificationError",
     "__version__",
     "build_authorization_url",

@@ -254,6 +254,7 @@ class LiveChat:
         self._channels: dict[int, ChannelRef] = {}  # chatroom_id -> ref
         self._ws: aiohttp.ClientWebSocketResponse[bool] | None = None
         self._stopping = False
+        self._running = False
         self._stop_event = asyncio.Event()
         self._connected = asyncio.Event()
         self._message_handlers: list[Callable[[LiveChatMessage], Any]] = []
@@ -320,6 +321,8 @@ class LiveChat:
     async def resolve(self, slug: str) -> ChannelRef:
         """Look up a channel's chatroom ID from its slug (kick.com/<slug>)."""
         slug = slug.strip().lower().removeprefix("https://kick.com/").strip("/")
+        if not slug or not all(c.isalnum() or c in "-_" for c in slug):
+            raise RealtimeError(f"not a valid Kick channel slug: {slug!r}")
         url = self.channel_info_url.format(slug=slug)
         headers = {"User-Agent": BROWSER_UA, "Accept": "application/json"}
         data: Any = None
@@ -427,10 +430,16 @@ class LiveChat:
         await asyncio.wait_for(self._connected.wait(), timeout)
 
     async def run(self) -> None:
-        """Connect and dispatch events until :meth:`stop` is called."""
-        self._stopping = False
-        self._stop_event.clear()
-        worker = asyncio.create_task(self._dispatch_worker())
+        """Connect and dispatch events until :meth:`stop` is called.
+
+        If :meth:`stop` was called before this started, it returns at once.
+        The instance can be run again after it returns.
+        """
+        if self._running:
+            raise RuntimeError("LiveChat.run() is already running")
+        self._running = True
+        self._inbox = asyncio.Queue(maxsize=10_000)
+        worker = asyncio.create_task(self._dispatch_worker(self._inbox))
         backoff = 1.0
         try:
             while not self._stopping:
@@ -480,13 +489,16 @@ class LiveChat:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 worker.cancel()
             for queue in list(self._queues):
-                with contextlib.suppress(asyncio.QueueFull):
-                    queue.put_nowait(None)
+                _put_end(queue)
+            # Reset so the instance can run again.
+            self._stopping = False
+            self._stop_event.clear()
+            self._running = False
             await self._close_session()
 
-    async def _dispatch_worker(self) -> None:
+    async def _dispatch_worker(self, inbox: asyncio.Queue[dict[str, Any] | None]) -> None:
         while True:
-            frame = await self._inbox.get()
+            frame = await inbox.get()
             if frame is None:
                 return
             if self._stopping:
@@ -539,6 +551,8 @@ class LiveChat:
                     try:
                         timeout = float(info.get("activity_timeout") or 120)
                     except (TypeError, ValueError):
+                        timeout = 120.0
+                    if not 10.0 <= timeout <= 600.0:  # also rejects NaN
                         timeout = 120.0
                     established = True
                     for ref in list(self._channels.values()):
@@ -614,6 +628,17 @@ class LiveChat:
     async def __aexit__(self, *exc: object) -> None:
         await self.stop()
         await self._close_session()
+
+
+def _put_end(queue: asyncio.Queue[LiveChatMessage | None]) -> None:
+    """Queue the end marker, dropping the oldest message if the queue is full."""
+    while True:
+        try:
+            queue.put_nowait(None)
+            return
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
 
 
 _PARSED_EVENTS: dict[str, tuple[type[KickModel], str]] = {

@@ -261,3 +261,42 @@ def test_anonymous_gifter() -> None:
     }
     gifts = SubscriptionGifts.model_validate(data)
     assert gifts.gifter.is_anonymous and gifts.gifter.user_id is None
+
+
+async def test_concurrent_retries_dispatch_once() -> None:
+    import asyncio
+
+    hook = WebhookHandler(PEM)
+    runs = []
+    release = asyncio.Event()
+
+    @hook.on(EventType.CHANNEL_FOLLOWED)
+    async def slow(event: WebhookEvent) -> None:
+        runs.append(event.message_id)
+        await release.wait()
+
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"])
+    tasks = [asyncio.create_task(hook.handle(headers, body)) for _ in range(5)]
+    await asyncio.sleep(0.05)
+    release.set()
+    results = await asyncio.gather(*tasks)
+    assert len(runs) == 1
+    assert sum(r is not None for r in results) == 1
+
+
+async def test_failed_key_fetch_fails_fast() -> None:
+    from kickpython import WebhookKeyUnavailable
+
+    hook = WebhookHandler()
+    calls = [0]
+
+    async def broken() -> rsa.RSAPublicKey:
+        calls[0] += 1
+        raise OSError("kick is down")
+
+    hook._fetch_key = broken  # type: ignore[method-assign]
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"])
+    for _ in range(10):
+        with pytest.raises(WebhookKeyUnavailable):
+            await hook.handle(headers, body)
+    assert calls[0] == 1

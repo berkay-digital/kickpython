@@ -194,3 +194,13 @@ async def test_sqlite_store_creates_parent_dirs(tmp_path: Path) -> None:
     store = SQLiteTokenStore(tmp_path / "nested" / "dir" / "t.db")
     await store.set(Token("a", refresh_token="r", user_id=1))
     assert (tmp_path / "nested" / "dir" / "t.db").exists()
+
+
+async def test_sqlite_store_tightens_existing_file(tmp_path: Path) -> None:
+    import os
+
+    path = tmp_path / "legacy.db"
+    sqlite3.connect(path).close()
+    os.chmod(path, 0o644)
+    await SQLiteTokenStore(path).user_ids()
+    assert path.stat().st_mode & 0o777 == 0o600

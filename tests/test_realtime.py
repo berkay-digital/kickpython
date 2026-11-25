@@ -202,3 +202,34 @@ async def test_stop_interrupts_backoff_and_ends_messages() -> None:
     await asyncio.wait_for(runner, 2)
     await asyncio.wait_for(consumer, 2)
     assert received == []
+
+
+async def test_stop_before_run_starts() -> None:
+    live = LiveChat(ws_url=_dead_url())
+    task = asyncio.create_task(live.run())
+    await live.stop()  # the task hasn't started yet
+    await asyncio.wait_for(task, 2)
+
+
+async def test_second_run_still_dispatches() -> None:
+    fake = FakePusher()
+    app = web.Application()
+    app.router.add_get("/ws", fake.handler)
+    server = TestServer(app)
+    await server.start_server()
+    live = LiveChat(ws_url=str(server.make_url("/ws")), max_backoff=0.05)
+    got: list[str] = []
+
+    @live.on_message
+    async def on_message(msg: LiveChatMessage) -> None:
+        got.append(msg.id)
+        await live.stop()
+
+    await live.join(REF)
+    try:
+        await asyncio.wait_for(live.run(), 5)
+        first = len(got)
+        await asyncio.wait_for(live.run(), 5)
+    finally:
+        await server.close()
+    assert first >= 1 and len(got) > first

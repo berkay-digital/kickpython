@@ -513,7 +513,11 @@ async def test_revoke_user_keeps_token_when_kick_fails(fake: FakeKick, client: K
     with pytest.raises(OAuthError):
         await client.revoke_user(7)
     assert await client.token_store.get(7) is not None
-    fake.on("POST", "/oauth/revoke", (400, {"error": "invalid token"}))
+    fake.on("POST", "/oauth/revoke", (400, {"error": "bad request"}))
+    with pytest.raises(OAuthError):
+        await client.revoke_user(7)
+    assert await client.token_store.get(7) is not None
+    fake.on("POST", "/oauth/revoke", (200, "OK"))
     await client.revoke_user(7)
     assert await client.token_store.get(7) is None
 
@@ -607,3 +611,76 @@ async def test_retry_after_http_date(fake: FakeKick, client: KickClient) -> None
         ok({"total_count": 2}),
     )
     assert (await client.livestreams.stats()).total_count == 2
+
+
+async def test_cancelled_refresh_is_joined_not_repeated(fake: FakeKick, client: KickClient) -> None:
+    import asyncio
+
+    await store_user(client, expires_in=0)
+    fake.on(
+        "POST",
+        "/oauth/token",
+        (200, {"access_token": "user-2", "refresh_token": "ref-2", "expires_in": 7200}),
+    )
+    gate = asyncio.Event()
+    original = fake.handle
+
+    async def slow_handle(request: web.Request) -> web.StreamResponse:
+        if request.path == "/oauth/token":
+            await gate.wait()
+        return await original(request)
+
+    fake.handle = slow_handle  # type: ignore[method-assign]
+    fake.on("GET", "/public/v1/users", ok([{"user_id": 7, "name": "b"}]))
+    me = client.as_user(7)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(me.users.me(), 0.2)  # cancelled mid-refresh
+    second = asyncio.create_task(me.users.me())
+    await asyncio.sleep(0.05)
+    gate.set()
+    assert (await second).user_id == 7
+    assert len(fake.calls("POST", "/oauth/token")) == 1  # the old refresh token was sent once
+    assert fake.calls("GET", "/public/v1/users")[0].bearer == "user-2"
+
+
+async def test_revoke_waits_for_inflight_refresh(fake: FakeKick, client: KickClient) -> None:
+    import asyncio
+
+    await store_user(client, expires_in=0)
+    gate = asyncio.Event()
+    original = fake.handle
+
+    async def slow_handle(request: web.Request) -> web.StreamResponse:
+        if request.path == "/oauth/token":
+            await gate.wait()
+        return await original(request)
+
+    fake.handle = slow_handle  # type: ignore[method-assign]
+    fake.on(
+        "POST",
+        "/oauth/token",
+        (200, {"access_token": "user-2", "refresh_token": "ref-2", "expires_in": 7200}),
+    )
+    fake.on("POST", "/oauth/revoke", (200, "OK"))
+    refresh = asyncio.create_task(client.refresh_user_token(7))
+    await asyncio.sleep(0.05)
+    revoke = asyncio.create_task(client.revoke_user(7))
+    await asyncio.sleep(0.05)
+    gate.set()
+    await refresh
+    await revoke
+    revoked = [dict(r.query)["token"] for r in fake.calls("POST", "/oauth/revoke")]
+    assert revoked == ["ref-2", "user-2"]  # the new pair, not the dead one
+    assert await client.token_store.get(7) is None
+
+
+async def test_bound_user_never_falls_back_to_static_token(fake: FakeKick) -> None:
+    async with KickClient(access_token="static", api_base=fake.base) as kick:
+        with pytest.raises(MissingTokenError):
+            await kick.as_user(5).chat.send("hi")
+
+
+async def test_dot_segments_are_rejected(client: KickClient) -> None:
+    await store_user(client)
+    with pytest.raises(ValueError, match="invalid ID"):
+        await client.as_user(7).chat.delete("..")

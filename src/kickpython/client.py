@@ -363,22 +363,18 @@ class KickClient:
     async def revoke_user(self, user_id: int | str | None = None) -> None:
         """Revoke a user's tokens at Kick, then remove them from the store.
 
-        A token Kick already considers invalid (HTTP 400) counts as revoked.
-        Any other failure raises and leaves the token stored, so you can retry.
+        Waits for any refresh in flight first, so the pair that gets revoked
+        is the current one. If Kick refuses either revocation the error is
+        raised and the token stays stored, so you can retry.
         """
         uid = self._require_user_id(user_id, "user_id")
-        token = await self._http.store.get(uid)
-        if token is not None:
-            pairs = [(token.refresh_token, "refresh_token"), (token.access_token, "access_token")]
-            for raw, hint in pairs:
-                if not raw:
-                    continue
-                try:
-                    await self.revoke_token(raw, hint=hint)  # type: ignore[arg-type]
-                except OAuthError as exc:
-                    if exc.status != 400:
-                        raise
-        await self._http.store.delete(uid)
+        async with self._http.exclusive_user(uid):
+            token = await self._http.store.get(uid)
+            if token is not None:
+                if token.refresh_token:
+                    await self.revoke_token(token.refresh_token, hint="refresh_token")
+                await self.revoke_token(token.access_token, hint="access_token")
+            await self._http.store.delete(uid)
 
     async def introspect(self, access_token: str | None = None) -> TokenInfo:
         """Check a token. Defaults to the token this client would use.
@@ -923,7 +919,10 @@ def _is_event_spec_tuple(value: Any) -> bool:
 
 def _seg(value: str) -> str:
     """Quote an ID for use as one URL path segment."""
-    return urllib.parse.quote(str(value), safe="")
+    text = str(value)
+    if text in ("", ".", ".."):
+        raise ValueError(f"invalid ID {text!r}")
+    return urllib.parse.quote(text, safe="")
 
 
 def _drop_none(**fields: Any) -> dict[str, Any]:
