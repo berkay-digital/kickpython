@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uv run ruff check src tests examples
       - run: uv run ruff format --check src tests examples
       - run: uv run mypy
@@ -31,13 +31,13 @@ jobs:
             resolution: lowest-direct
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uv run --isolated --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} --group dev pytest -q
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.4.0
       - run: uv build
       - run: uvx twine check --strict dist/*
