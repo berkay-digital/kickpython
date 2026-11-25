@@ -40,7 +40,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from .errors import KickError, WebhookVerificationError
-from .events import WebhookEvent, payload_model
+from .events import DROPS_REWARD_CLAIMED, WebhookEvent, payload_model
 from .scopes import EventType
 
 if TYPE_CHECKING:
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .client import KickClient
 
 __all__ = [
+    "HEADER_DROPS_TIMESTAMP",
     "HEADER_EVENT_TYPE",
     "HEADER_EVENT_VERSION",
     "HEADER_MESSAGE_ID",
@@ -67,6 +68,7 @@ HEADER_MESSAGE_ID = "Kick-Event-Message-Id"
 HEADER_SUBSCRIPTION_ID = "Kick-Event-Subscription-Id"
 HEADER_SIGNATURE = "Kick-Event-Signature"
 HEADER_TIMESTAMP = "Kick-Event-Message-Timestamp"
+HEADER_DROPS_TIMESTAMP = "Kick-Event-Timestamp"  # Drops claim webhooks use this name
 HEADER_EVENT_TYPE = "Kick-Event-Type"
 HEADER_EVENT_VERSION = "Kick-Event-Version"
 PUBLIC_KEY_URL = "https://api.kick.com/public/v1/public-key"
@@ -136,19 +138,31 @@ def _parse_timestamp(value: str) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
+def _timestamp_header(headers: Mapping[str, str]) -> str | None:
+    return _header(headers, HEADER_TIMESTAMP) or _header(headers, HEADER_DROPS_TIMESTAMP)
+
+
+def _is_drops_claim(data: Mapping[str, object]) -> bool:
+    return all(k in data for k in ("claim_id", "campaign_id", "reward_id"))
+
+
 def parse_event(headers: Mapping[str, str], body: bytes | str) -> WebhookEvent:
     """Parse a delivery without verifying it. Use :class:`WebhookHandler` in production."""
     raw_body = body.encode() if isinstance(body, str) else body
-    event_type = _header(headers, HEADER_EVENT_TYPE)
     message_id = _header(headers, HEADER_MESSAGE_ID)
-    if not event_type or not message_id:
-        raise WebhookVerificationError("missing Kick-Event-Type or Kick-Event-Message-Id header")
+    if not message_id:
+        raise WebhookVerificationError("missing Kick-Event-Message-Id header")
     try:
         data = json.loads(raw_body)
     except ValueError as exc:
         raise WebhookVerificationError("webhook body is not JSON") from exc
     if not isinstance(data, dict):
         raise WebhookVerificationError("webhook body is not a JSON object")
+    event_type = _header(headers, HEADER_EVENT_TYPE)
+    if not event_type:
+        if not _is_drops_claim(data):
+            raise WebhookVerificationError("missing Kick-Event-Type header")
+        event_type = DROPS_REWARD_CLAIMED
     version_raw = _header(headers, HEADER_EVENT_VERSION) or "1"
     try:
         version = int(version_raw.strip().strip('"'))
@@ -163,7 +177,7 @@ def parse_event(headers: Mapping[str, str], body: bytes | str) -> WebhookEvent:
             log.warning(
                 "could not parse %s v%s payload; see event.raw", event_type, version, exc_info=True
             )
-    ts_header = _header(headers, HEADER_TIMESTAMP)
+    ts_header = _timestamp_header(headers)
     return WebhookEvent(
         type=event_type,
         version=version,
@@ -317,7 +331,7 @@ class WebhookHandler:
         fetched; answer that with HTTP 503 so Kick retries later.
         """
         message_id = _header(headers, HEADER_MESSAGE_ID)
-        timestamp = _header(headers, HEADER_TIMESTAMP)
+        timestamp = _timestamp_header(headers)
         signature = _header(headers, HEADER_SIGNATURE)
         if not message_id or not timestamp or not signature:
             raise WebhookVerificationError("missing Kick-Event-* signature headers")
@@ -339,8 +353,8 @@ class WebhookHandler:
         raise WebhookVerificationError("invalid Kick-Event-Signature")
 
     def _check_broadcaster(self, event: WebhookEvent) -> None:
-        if self.broadcaster_user_ids is None:
-            return
+        if self.broadcaster_user_ids is None or event.type == DROPS_REWARD_CLAIMED:
+            return  # Drops claims belong to the organization, not to a channel
         broadcaster = event.raw.get("broadcaster")
         uid = broadcaster.get("user_id") if isinstance(broadcaster, dict) else None
         if uid is None or int(uid) not in self.broadcaster_user_ids:
@@ -388,6 +402,10 @@ class WebhookHandler:
         event = await self.accept(headers, body)
         if event is None:
             return None
+        await self._dispatch_once(event)
+        return event
+
+    async def _dispatch_once(self, event: WebhookEvent) -> None:
         # Reserve the ID before awaiting handlers, so a concurrent retry of the
         # same delivery is dropped. Released if a handler raises.
         self._inflight.add(event.message_id)
@@ -396,7 +414,6 @@ class WebhookHandler:
             self._remember(event.message_id)
         finally:
             self._inflight.discard(event.message_id)
-        return event
 
     async def dispatch(self, event: WebhookEvent) -> None:
         for func in [*self._handlers.get(event.type, []), *self._catch_all]:
@@ -407,7 +424,13 @@ class WebhookHandler:
     # aiohttp integration --------------------------------------------------
 
     async def aiohttp_handler(self, request: web.Request) -> web.Response:
-        """An aiohttp request handler. Answers quickly; handler errors are logged."""
+        """An aiohttp request handler.
+
+        Event webhooks get 200 as soon as they verify, and handlers run in the
+        background (errors are logged). Drops claims are synchronous, as Kick
+        requires: handlers run first, and the answer is 200 only if they
+        succeed, otherwise 500.
+        """
         from aiohttp import web
 
         body = await request.read()
@@ -419,7 +442,16 @@ class WebhookHandler:
         except WebhookKeyUnavailable as exc:
             log.warning("could not verify webhook: %s", exc)
             return web.Response(status=503, text="try again")
-        if event is not None:
+        if event is None and _header(request.headers, HEADER_MESSAGE_ID) in self._inflight:
+            # The first copy is still being handled; don't confirm what may yet fail.
+            return web.Response(status=503, text="still processing")
+        if event is not None and event.type == DROPS_REWARD_CLAIMED:
+            try:
+                await self._dispatch_once(event)
+            except Exception:
+                log.exception("drops claim handler failed for %s", event.message_id)
+                return web.Response(status=500, text="claim not processed")
+        elif event is not None:
             self._remember(event.message_id)
             task = asyncio.create_task(self._safe_dispatch(event))
             self._tasks.add(task)

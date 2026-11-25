@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 (2026-11-25)
+
+### Added
+
+- Drops reward claim webhooks. `WebhookHandler` now accepts them (no `Kick-Event-Type` header, `Kick-Event-Timestamp` header) as `DROPS_REWARD_CLAIMED` with a `DropsRewardClaimed` payload. The aiohttp route handles them synchronously, as Kick requires: 200 after your handlers succeed, 500 if one fails, 503 for a copy that arrives while the first is still running.
+
+### Docs
+
+- Moderation: Kick's bare 400 for targets that can't be moderated.
+- Offline `custom_tags` updates don't show until the channel is live.
+- Drops endpoints return 500 for apps without an organization.
+
 ## 1.0.0 (2026-11-25)
 
 A rewrite against the current Kick API. Not compatible with 0.x; see [docs/migrating.md](docs/migrating.md).

@@ -21,8 +21,10 @@ from .errors import (
     WebhookVerificationError,
 )
 from .events import (
+    DROPS_REWARD_CLAIMED,
     ChannelFollowed,
     ChatMessage,
+    DropsRewardClaimed,
     EventUser,
     KicksGifted,
     LivestreamMetadataUpdated,
@@ -61,6 +63,7 @@ from .tokens import JSONFileTokenStore, MemoryTokenStore, SQLiteTokenStore, Toke
 from .webhooks import WebhookHandler, WebhookKeyUnavailable, parse_event, verify_signature
 
 __all__ = [
+    "DROPS_REWARD_CLAIMED",
     "AdBreak",
     "AdBreakStatus",
     "AuthorizationRequest",
@@ -73,6 +76,7 @@ __all__ = [
     "ChatMessageSent",
     "ConflictError",
     "DropsClaim",
+    "DropsRewardClaimed",
     "EventSubscription",
     "EventType",
     "EventUser",
