@@ -241,7 +241,10 @@ def payload_model(event_type: str) -> type[EventPayload] | None:
 
 
 class WebhookEvent(BaseModel):
-    """A verified webhook delivery."""
+    """A webhook delivery whose signature checked out.
+
+    ``type``, ``version`` and ``subscription_id`` come from unsigned headers.
+    """
 
     type: str
     version: int

@@ -229,6 +229,9 @@ class SQLiteTokenStore:
         self._ready = False
 
     def _connect(self) -> sqlite3.Connection:
+        if not self._ready and self.path != ":memory:" and not os.path.exists(self.path):
+            # Create the file owner-only before SQLite does, so tokens aren't world readable.
+            os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
         conn = sqlite3.connect(self.path)
         if not self._ready:
             conn.execute(
@@ -260,7 +263,7 @@ class SQLiteTokenStore:
         return Token(
             access_token=access,
             refresh_token=refresh or None,
-            expires_at=float(expires_at) if expires_at is not None else None,
+            expires_at=float(expires_at) if expires_at else None,  # 0 means unknown
             scopes=tuple((scope or "").split()),
             user_id=int(user_id),
             refresh_expires_at=float(refresh_expires_at) if refresh_expires_at else None,

@@ -55,6 +55,8 @@ class FakePusher:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         self.connections += 1
+        await ws.send_str("not json")  # junk must not kill the listener
+        await ws.send_str("[1, 2]")
         await ws.send_str(
             json.dumps(
                 {

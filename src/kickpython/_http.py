@@ -175,9 +175,20 @@ class Transport:
             return tok
 
     async def refresh(self, token: Token) -> Token:
-        client_id, secret = self.require_credentials()
+        """Refresh ``token`` and save the result.
+
+        Kick rotates the refresh token, so once the request is sent the old
+        pair is dead. The exchange and the save run shielded from
+        cancellation, so a timeout or shutdown can't drop the new pair.
+        """
+        self.require_credentials()
         if not token.refresh_token:
             raise MissingTokenError(f"token for user {token.user_id} has no refresh token")
+        return await asyncio.shield(self._refresh_and_save(token))
+
+    async def _refresh_and_save(self, token: Token) -> Token:
+        client_id, secret = self.require_credentials()
+        assert token.refresh_token is not None and token.user_id is not None
         try:
             data = await self.oauth_post(
                 "/oauth/token",
@@ -190,6 +201,11 @@ class Transport:
             )
         except OAuthError as exc:
             if exc.status in (400, 401):
+                # Another process sharing the store may have refreshed first.
+                current = await self.store.get(token.user_id)
+                if current is not None and current.refresh_token != token.refresh_token:
+                    log.info("token for user %s was refreshed elsewhere", token.user_id)
+                    return current
                 raise MissingTokenError(
                     f"refreshing the token for user {token.user_id} failed ({exc.status}); "
                     "the user needs to authorize the app again"
@@ -198,7 +214,20 @@ class Transport:
         new = Token.from_oauth_response(data, user_id=token.user_id)
         if not new.scopes:
             new = replace(new, scopes=token.scopes)
-        await self.store.set(new)
+        if not new.refresh_token:
+            new = replace(
+                new, refresh_token=token.refresh_token, refresh_expires_at=token.refresh_expires_at
+            )
+        try:
+            await self.store.set(new)
+        except Exception:
+            log.critical(
+                "refreshed the token for user %s but could not save it; the old refresh "
+                "token no longer works",
+                token.user_id,
+                exc_info=True,
+            )
+            raise
         log.info("refreshed access token for user %s", token.user_id)
         return new
 

@@ -24,6 +24,7 @@ class Recorded:
     query: list[tuple[str, str]]
     headers: dict[str, str]
     body: bytes
+    raw_path: str = ""
 
     @property
     def json(self) -> Any:
@@ -67,6 +68,7 @@ class FakeKick:
                 list(request.query.items()),
                 dict(request.headers),
                 body,
+                request.raw_path,
             )
         )
         queue = self.routes.get((request.method, request.path))

@@ -156,3 +156,18 @@ async def test_sqlite_store_reads_legacy_database(tmp_path: Path) -> None:
     )
     again = await store.get(1710384)
     assert again is not None and again.refresh_expires_at == 2.1e9
+
+
+async def test_sqlite_store_is_private_and_handles_unknown_expiry(tmp_path: Path) -> None:
+    import os
+
+    path = tmp_path / "new.db"
+    old = os.umask(0o022)
+    try:
+        store = SQLiteTokenStore(path)
+        await store.set(Token("a", refresh_token="r", user_id=1))
+    finally:
+        os.umask(old)
+    assert path.stat().st_mode & 0o777 == 0o600
+    tok = await store.get(1)
+    assert tok is not None and tok.expires_at is None and not tok.is_expired()

@@ -61,9 +61,22 @@ async def kick_webhook(request: Request):
 
 ## What gets checked
 
-- **Signature.** Kick signs `"{Kick-Event-Message-Id}.{Kick-Event-Message-Timestamp}.{body}"` with RSA (PKCS#1 v1.5, SHA-256). The handler fetches Kick's public key from `GET /public/v1/public-key`. If a signature fails, it fetches the key once more in case Kick rotated it. Pass `public_key=` to pin a key and skip fetching.
+- **Signature.** Kick signs `"{Kick-Event-Message-Id}.{Kick-Event-Message-Timestamp}.{body}"` with RSA (PKCS#1 v1.5, SHA-256). The handler fetches Kick's public key from `GET /public/v1/public-key` with a 10 second timeout. When a signature fails it fetches the key again in case Kick rotated it, but at most once every `key_refresh_interval` seconds (default 300). That stops forged requests from turning into a flood of key fetches. Pass `public_key=` to pin a key and never fetch.
 - **Age.** Deliveries whose timestamp is more than `max_age` seconds (default 600) from now are rejected. Set `max_age=None` to turn this off.
-- **Duplicates.** Kick may deliver the same message twice. The handler remembers the last `dedupe_size` (default 2048) message IDs and drops repeats. This memory is per process.
+- **Duplicates.** Kick may deliver the same message twice. The handler remembers message IDs for twice `max_age`, so a replay inside the accepted window is dropped. This memory is per process. With `handle()`, an ID is only remembered after your handlers succeed, so if one raises, Kick's retry runs them again.
+- **Broadcaster.** Optional. With `broadcaster_user_ids=[...]`, deliveries for any other channel are rejected.
+
+### What the signature doesn't cover
+
+Kick signs deliveries for every app with the same key, and the `Kick-Event-Type`, `Kick-Event-Version` and `Kick-Event-Subscription-Id` headers are not signed. Someone with their own Kick app can capture a genuine delivery for a channel they subscribed to and post it to your endpoint within the `max_age` window. They can also change the type header.
+
+So:
+
+- Pass `broadcaster_user_ids` (for example `await kick.token_store.user_ids()`) when you only serve your own channels.
+- Check fields in the payload, such as `msg.broadcaster.user_id`, before you hand out rewards.
+- Keep handlers idempotent.
+
+If the public key can't be fetched at all, `verify` raises the network error rather than `WebhookVerificationError`. The aiohttp route answers 503 in that case so Kick retries later.
 
 ## Event types
 

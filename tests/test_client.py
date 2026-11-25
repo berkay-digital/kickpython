@@ -456,3 +456,63 @@ async def test_public_key_needs_no_auth(fake: FakeKick, client: KickClient) -> N
     fake.on("GET", "/public/v1/public-key", ok({"public_key": "PEM"}))
     assert await client.public_key() == "PEM"
     assert fake.calls("GET", "/public/v1/public-key")[0].bearer is None
+
+
+async def test_ids_are_quoted_in_paths(fake: FakeKick, client: KickClient) -> None:
+    await store_user(client)
+    fake.on("DELETE", "/public/v1/chat/../moderation/bans", (204, None))
+    await client.as_user(7).chat.delete("../moderation/bans")
+    (call,) = fake.calls("DELETE", "/public/v1/chat/../moderation/bans")
+    assert call.raw_path == "/public/v1/chat/..%2Fmoderation%2Fbans"
+
+
+async def test_refresh_keeps_refresh_token_when_kick_omits_it(
+    fake: FakeKick, client: KickClient
+) -> None:
+    await store_user(client, expires_in=0)
+    fake.on("POST", "/oauth/token", (200, {"access_token": "user-2", "expires_in": 7200}))
+    fake.on("GET", "/public/v1/users", ok([{"user_id": 7, "name": "b"}]))
+    await client.as_user(7).users.me()
+    saved = await client.token_store.get(7)
+    assert saved is not None and saved.access_token == "user-2"
+    assert saved.refresh_token == "ref-1"
+
+
+async def test_refresh_lost_race_uses_token_saved_elsewhere(
+    fake: FakeKick, client: KickClient
+) -> None:
+    await store_user(client, expires_in=0)
+
+    def other_process_wins(request: web.Request, _: bytes) -> tuple[int, object]:
+        # Simulate another process refreshing and saving first.
+        import asyncio
+
+        asyncio.get_running_loop().create_task(
+            client.token_store.set(
+                Token(
+                    "from-other",
+                    expires_at=time.time() + 7200,
+                    refresh_token="ref-other",
+                    user_id=7,
+                )
+            )
+        )
+        return 400, {"error": "invalid_grant"}
+
+    fake.on("POST", "/oauth/token", other_process_wins)
+    fake.on("GET", "/public/v1/users", ok([{"user_id": 7, "name": "b"}]))
+    await client.as_user(7).users.me()
+    assert fake.calls("GET", "/public/v1/users")[0].bearer == "from-other"
+
+
+async def test_revoke_user_keeps_token_when_kick_fails(fake: FakeKick, client: KickClient) -> None:
+    from kickpython import OAuthError
+
+    await store_user(client)
+    fake.on("POST", "/oauth/revoke", (503, "unavailable"))
+    with pytest.raises(OAuthError):
+        await client.revoke_user(7)
+    assert await client.token_store.get(7) is not None
+    fake.on("POST", "/oauth/revoke", (400, {"error": "invalid token"}))
+    await client.revoke_user(7)
+    assert await client.token_store.get(7) is None

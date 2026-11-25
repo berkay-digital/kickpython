@@ -130,22 +130,87 @@ async def test_handler_rejects_bad_requests() -> None:
     assert await hook.handle(lower, body) is not None
 
 
+def _fake_key_source(hook: WebhookHandler, pems: list[str]) -> list[int]:
+    calls = [0]
+
+    async def fetch() -> rsa.RSAPublicKey:
+        calls[0] += 1
+        pem = pems.pop(0) if len(pems) > 1 else pems[0]
+        return serialization.load_pem_public_key(pem.encode())  # type: ignore[return-value]
+
+    hook._fetch_key = fetch  # type: ignore[method-assign]
+    return calls
+
+
 async def test_handler_refetches_rotated_key() -> None:
     new_key, new_pem = make_key()
-    pems = [PEM, new_pem]
-
-    class FakeClient:
-        calls = 0
-
-        async def public_key(self) -> str:
-            FakeClient.calls += 1
-            return pems.pop(0)
-
-    hook = WebhookHandler(client=FakeClient())  # type: ignore[arg-type]
+    hook = WebhookHandler()
+    calls = _fake_key_source(hook, [PEM, new_pem])
     headers, body = signed("kicks.gifted", SAMPLES["kicks.gifted"], key=new_key)
+    hook.key_refresh_interval = 0
     event = await hook.handle(headers, body)
     assert event is not None and isinstance(event.payload, KicksGifted)
-    assert FakeClient.calls == 2
+    assert calls[0] == 2
+
+
+async def test_forged_requests_cannot_force_key_refetches() -> None:
+    hook = WebhookHandler()
+    calls = _fake_key_source(hook, [PEM])
+    forger, _ = make_key()
+    for i in range(20):
+        headers, body = signed(
+            "channel.followed", SAMPLES["channel.followed"], key=forger, message_id=f"forged-{i}"
+        )
+        with pytest.raises(WebhookVerificationError):
+            await hook.handle(headers, body)
+    assert calls[0] == 1  # the initial fetch only; refetches are on cooldown
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"])
+    assert await hook.handle(headers, body) is not None
+
+
+async def test_broadcaster_allowlist() -> None:
+    hook = WebhookHandler(PEM, broadcaster_user_ids=[123456789])
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"])
+    assert await hook.handle(headers, body) is not None
+    other = WebhookHandler(PEM, broadcaster_user_ids=[1])
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"], message_id="m2")
+    with pytest.raises(WebhookVerificationError, match="not one of yours"):
+        await other.handle(headers, body)
+
+
+async def test_failed_handler_lets_retry_through() -> None:
+    hook = WebhookHandler(PEM)
+    attempts = []
+
+    @hook.on(EventType.CHANNEL_FOLLOWED)
+    def flaky(event: WebhookEvent) -> None:
+        attempts.append(event.message_id)
+        if len(attempts) == 1:
+            raise RuntimeError("database down")
+
+    headers, body = signed("channel.followed", SAMPLES["channel.followed"])
+    with pytest.raises(RuntimeError):
+        await hook.handle(headers, body)
+    assert await hook.handle(headers, body) is not None
+    assert await hook.handle(headers, body) is None
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-01-14T16:08:06Z",
+        "2026-01-14T16:08:06.1Z",
+        "2026-01-14T16:08:06.12345Z",
+        "2026-01-14T16:08:06.123456789Z",
+        "2026-01-14T16:08:06+00:00",
+    ],
+)
+def test_timestamp_formats(stamp: str) -> None:
+    from kickpython.webhooks import _parse_timestamp
+
+    ts = _parse_timestamp(stamp)
+    assert ts is not None and ts.tzinfo is not None and ts.second == 6
 
 
 async def test_unknown_event_type_keeps_raw() -> None:

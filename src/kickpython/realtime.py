@@ -431,6 +431,8 @@ class LiveChat:
                     log.warning("Pusher refused the connection (%s); refetching credentials", exc)
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     log.warning("live chat connection failed: %s", exc)
+                except Exception:
+                    log.exception("unexpected error in live chat connection; reconnecting")
                 finally:
                     self._connected.clear()
                     self._ws = None
@@ -473,11 +475,20 @@ class LiveChat:
                     return established
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                frame = json.loads(msg.data)
+                frame = _maybe_json(msg.data)
+                if not isinstance(frame, dict):
+                    log.debug("ignoring malformed frame: %.200r", msg.data)
+                    continue
                 event = frame.get("event")
+                if not isinstance(event, str):
+                    continue
                 if event == "pusher:connection_established":
-                    info = _maybe_json(frame.get("data")) or {}
-                    timeout = float(info.get("activity_timeout") or 120)
+                    info = _maybe_json(frame.get("data"))
+                    info = info if isinstance(info, dict) else {}
+                    try:
+                        timeout = float(info.get("activity_timeout") or 120)
+                    except (TypeError, ValueError):
+                        timeout = 120.0
                     established = True
                     for ref in list(self._channels.values()):
                         await self._subscribe(ref)
@@ -486,12 +497,16 @@ class LiveChat:
                 elif event == "pusher:ping":
                     await self._send("pusher:pong", {})
                 elif event == "pusher:error":
-                    err = _maybe_json(frame.get("data")) or {}
-                    code = int(err.get("code") or 0)
+                    err = _maybe_json(frame.get("data"))
+                    err = err if isinstance(err, dict) else {}
+                    try:
+                        code = int(err.get("code") or 0)
+                    except (TypeError, ValueError):
+                        code = 0
                     if 4000 <= code < 4100:
                         raise _FatalPusherError(f"{code} {err.get('message')}")
                     log.warning("Pusher error: %s", err)
-                elif event and not event.startswith("pusher"):
+                elif not event.startswith("pusher"):
                     await self._dispatch(frame)
         return established
 

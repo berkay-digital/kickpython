@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-import contextlib
+import urllib.parse
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -341,22 +341,38 @@ class KickClient:
         )
 
     async def revoke_user(self, user_id: int | str | None = None) -> None:
-        """Revoke a user's tokens at Kick and remove them from the store."""
+        """Revoke a user's tokens at Kick, then remove them from the store.
+
+        A token Kick already considers invalid (HTTP 400) counts as revoked.
+        Any other failure raises and leaves the token stored, so you can retry.
+        """
         uid = self._require_user_id(user_id, "user_id")
         token = await self._http.store.get(uid)
         if token is not None:
-            if token.refresh_token:
-                with contextlib.suppress(OAuthError):
-                    await self.revoke_token(token.refresh_token, hint="refresh_token")
-            with contextlib.suppress(OAuthError):
-                await self.revoke_token(token.access_token, hint="access_token")
+            pairs = [(token.refresh_token, "refresh_token"), (token.access_token, "access_token")]
+            for raw, hint in pairs:
+                if not raw:
+                    continue
+                try:
+                    await self.revoke_token(raw, hint=hint)  # type: ignore[arg-type]
+                except OAuthError as exc:
+                    if exc.status != 400:
+                        raise
         await self._http.store.delete(uid)
 
     async def introspect(self, access_token: str | None = None) -> TokenInfo:
-        """Check a token. Defaults to the token this client would use."""
+        """Check a token. Defaults to the token this client would use.
+
+        Revoked, expired or unknown tokens give ``active=False``.
+        """
         if access_token is None:
             access_token, _ = await self._http._bearer("any", self._user_id)
-        body = await self._http.oauth_post("/oauth/token/introspect", bearer=access_token)
+        try:
+            body = await self._http.oauth_post("/oauth/token/introspect", bearer=access_token)
+        except OAuthError as exc:
+            if exc.status == 401:  # Kick answers 401 for revoked or unknown tokens
+                return TokenInfo(active=False)
+            raise
         return _parse(TokenInfo, _data(body))
 
     async def public_key(self) -> str:
@@ -494,7 +510,7 @@ class ChatAPI(_Resource):
 
     async def delete(self, message_id: str) -> None:
         """Delete a chat message. Needs ``moderation:chat_message:manage``."""
-        await self._req("DELETE", f"/public/v1/chat/{message_id}", auth="user")
+        await self._req("DELETE", f"/public/v1/chat/{_seg(message_id)}", auth="user")
 
 
 class ModerationAPI(_Resource):
@@ -609,14 +625,14 @@ class RewardsAPI(_Resource):
             raise ValueError("set at least one field to update")
         data = _data(
             await self._req(
-                "PATCH", f"/public/v1/channels/rewards/{reward_id}", auth="user", json=body
+                "PATCH", f"/public/v1/channels/rewards/{_seg(reward_id)}", auth="user", json=body
             )
         )
         return _parse(Reward, data)
 
     async def delete(self, reward_id: str) -> None:
         """Delete a reward. Only the app that created a reward can delete it."""
-        await self._req("DELETE", f"/public/v1/channels/rewards/{reward_id}", auth="user")
+        await self._req("DELETE", f"/public/v1/channels/rewards/{_seg(reward_id)}", auth="user")
 
     async def redemptions(
         self,
@@ -867,6 +883,11 @@ class DropsAPI(_Resource):
             await self._req(
                 "PATCH", "/public/v1/drops/claims", auth="app", json={"claims": list(chunk)}
             )
+
+
+def _seg(value: str) -> str:
+    """Quote an ID for use as one URL path segment."""
+    return urllib.parse.quote(str(value), safe="")
 
 
 def _drop_none(**fields: Any) -> dict[str, Any]:

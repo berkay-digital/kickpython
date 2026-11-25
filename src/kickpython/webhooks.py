@@ -28,8 +28,10 @@ import binascii
 import inspect
 import json
 import logging
+import re
+import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, TypeVar
 
@@ -67,6 +69,7 @@ HEADER_TIMESTAMP = "Kick-Event-Message-Timestamp"
 HEADER_EVENT_TYPE = "Kick-Event-Type"
 HEADER_EVENT_VERSION = "Kick-Event-Version"
 PUBLIC_KEY_URL = "https://api.kick.com/public/v1/public-key"
+KEY_FETCH_TIMEOUT = 10.0
 
 Handler = Callable[[WebhookEvent], Awaitable[None] | None]
 H = TypeVar("H", bound=Handler)
@@ -112,9 +115,15 @@ def verify_signature(
     return True
 
 
+_FRACTION = re.compile(r"\.(\d+)")
+
+
 def _parse_timestamp(value: str) -> datetime | None:
+    # Python 3.10's fromisoformat only takes 3 or 6 fractional digits.
+    text = value.strip().replace("Z", "+00:00").replace("z", "+00:00")
+    text = _FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
     try:
-        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(text)
     except ValueError:
         return None
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
@@ -162,15 +171,25 @@ def parse_event(headers: Mapping[str, str], body: bytes | str) -> WebhookEvent:
 class WebhookHandler:
     """Verifies webhook deliveries and dispatches them to your handlers.
 
+    Only the message ID, timestamp and body are signed. The
+    ``Kick-Event-Type``, ``-Version`` and ``-Subscription-Id`` headers are not,
+    and Kick signs deliveries for every app with the same key. So a valid
+    signature proves Kick sent the body to *some* app, not that it is an event
+    you subscribed to. Pass ``broadcaster_user_ids`` to accept only events for
+    your channels, and keep handlers idempotent.
+
     Args:
         public_key: Kick's public key (PEM). If omitted it is fetched from the
-            API on first use, and refetched once when a signature fails, since
-            Kick may rotate the key at any time.
-        client: Optional :class:`~kickpython.KickClient` used to fetch the key.
-        max_age: Reject deliveries whose timestamp is older (or further in the
-            future) than this many seconds. ``None`` turns the check off.
-        dedupe_size: How many recent message IDs to remember, to drop the
-            retries Kick sends when a previous delivery looked failed.
+            API on first use. After a signature failure it is refetched, at
+            most once per ``key_refresh_interval``, since Kick may rotate it.
+        client: Optional :class:`~kickpython.KickClient` whose session and API
+            base URL are used to fetch the key.
+        broadcaster_user_ids: If set, reject deliveries whose body names a
+            different broadcaster (``broadcaster.user_id``).
+        max_age: Reject deliveries whose timestamp is further than this many
+            seconds from now. ``None`` turns the check off (and makes duplicate
+            detection best effort).
+        key_refresh_interval: Minimum seconds between key refetches.
     """
 
     def __init__(
@@ -178,16 +197,25 @@ class WebhookHandler:
         public_key: str | bytes | None = None,
         *,
         client: KickClient | None = None,
+        broadcaster_user_ids: Iterable[int] | None = None,
         max_age: float | None = 600,
-        dedupe_size: int = 2048,
+        key_refresh_interval: float = 300,
+        dedupe_limit: int = 100_000,
     ) -> None:
         self._key = _load_key(public_key) if public_key else None
         self._pinned = public_key is not None
         self._client = client
         self._key_lock = asyncio.Lock()
+        self._last_fetch = float("-inf")
+        self.key_refresh_interval = key_refresh_interval
+        self.broadcaster_user_ids = (
+            frozenset(int(i) for i in broadcaster_user_ids)
+            if broadcaster_user_ids is not None
+            else None
+        )
         self.max_age = max_age
-        self._seen: OrderedDict[str, None] = OrderedDict()
-        self._dedupe_size = dedupe_size
+        self._seen: OrderedDict[str, float] = OrderedDict()
+        self._dedupe_limit = dedupe_limit
         self._handlers: dict[str, list[Handler]] = {}
         self._catch_all: list[Handler] = []
         self._tasks: set[asyncio.Task[None]] = set()
@@ -212,32 +240,63 @@ class WebhookHandler:
     # Key management -----------------------------------------------------
 
     async def _fetch_key(self) -> rsa.RSAPublicKey:
-        if self._client is not None:
-            pem = await self._client.public_key()
-        else:
-            import aiohttp
+        import aiohttp
 
+        timeout = aiohttp.ClientTimeout(total=KEY_FETCH_TIMEOUT)
+        headers = {"Accept": "application/json", "User-Agent": "kickpython-webhooks"}
+        if self._client is not None:
+            http = self._client._http
+            url = f"{http.api_base}/public/v1/public-key"
+            async with http.session.get(url, headers=headers, timeout=timeout) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        else:
             async with (
-                aiohttp.ClientSession() as session,
-                session.get(
-                    PUBLIC_KEY_URL,
-                    headers={"Accept": "application/json", "User-Agent": "kickpython-webhooks"},
-                ) as resp,
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.get(PUBLIC_KEY_URL, headers=headers) as resp,
             ):
                 resp.raise_for_status()
-                pem = (await resp.json())["data"]["public_key"]
-        return _load_key(pem)
+                data = await resp.json(content_type=None)
+        return _load_key(data["data"]["public_key"])
 
-    async def _get_key(self, *, refresh: bool = False) -> rsa.RSAPublicKey:
+    async def _current_key(self) -> rsa.RSAPublicKey:
+        key = self._key
+        if key is not None:
+            return key
         async with self._key_lock:
-            if self._key is None or (refresh and not self._pinned):
+            if self._key is None:
                 self._key = await self._fetch_key()
+                self._last_fetch = time.monotonic()
             return self._key
+
+    async def _rotated_key(self, failed: rsa.RSAPublicKey) -> rsa.RSAPublicKey | None:
+        """A newer key than ``failed``, or ``None`` if refetching is on cooldown or fails."""
+        if self._pinned:
+            return None
+        async with self._key_lock:
+            if self._key is not None and self._key is not failed:
+                return self._key  # another request already refetched
+            if time.monotonic() - self._last_fetch < self.key_refresh_interval:
+                return None
+            self._last_fetch = time.monotonic()
+            try:
+                key = await self._fetch_key()
+            except Exception as exc:
+                log.warning("could not refetch Kick's public key: %s", exc)
+                return None
+            if key.public_numbers() == failed.public_numbers():
+                return None
+            self._key = key
+            return key
 
     # Processing ---------------------------------------------------------
 
     async def verify(self, headers: Mapping[str, str], body: bytes) -> None:
-        """Raise :class:`WebhookVerificationError` unless the delivery is genuine and fresh."""
+        """Raise :class:`WebhookVerificationError` unless the delivery is genuine and fresh.
+
+        May raise other exceptions (network errors) if the public key can't
+        be fetched at all; answer those with HTTP 5xx so Kick retries.
+        """
         message_id = _header(headers, HEADER_MESSAGE_ID)
         timestamp = _header(headers, HEADER_TIMESTAMP)
         signature = _header(headers, HEADER_SIGNATURE)
@@ -250,47 +309,68 @@ class WebhookHandler:
             skew = abs(datetime.now(timezone.utc) - ts)
             if skew > timedelta(seconds=self.max_age):
                 raise WebhookVerificationError(f"delivery is too old ({skew})")
-        if verify_signature(
-            await self._get_key(),
-            message_id=message_id,
-            timestamp=timestamp,
-            body=body,
-            signature=signature,
-        ):
+        args = (message_id, timestamp, body, signature)
+        key = await self._current_key()
+        if _check(key, *args):
             return
-        if not self._pinned and verify_signature(
-            await self._get_key(refresh=True),
-            message_id=message_id,
-            timestamp=timestamp,
-            body=body,
-            signature=signature,
-        ):
+        newer = await self._rotated_key(key)
+        if newer is not None and _check(newer, *args):
             log.info("Kick webhook public key changed; using the new key")
             return
         raise WebhookVerificationError("invalid Kick-Event-Signature")
 
-    def _is_duplicate(self, message_id: str) -> bool:
-        if message_id in self._seen:
-            self._seen.move_to_end(message_id)
-            return True
-        self._seen[message_id] = None
-        while len(self._seen) > self._dedupe_size:
-            self._seen.popitem(last=False)
-        return False
+    def _check_broadcaster(self, event: WebhookEvent) -> None:
+        if self.broadcaster_user_ids is None:
+            return
+        broadcaster = event.raw.get("broadcaster")
+        uid = broadcaster.get("user_id") if isinstance(broadcaster, dict) else None
+        if uid is None or int(uid) not in self.broadcaster_user_ids:
+            raise WebhookVerificationError(f"event is for broadcaster {uid}, not one of yours")
+
+    def _seen_before(self, message_id: str) -> bool:
+        return message_id in self._seen
+
+    def _remember(self, message_id: str) -> None:
+        now = time.monotonic()
+        self._seen[message_id] = now
+        self._seen.move_to_end(message_id)
+        # Forget IDs once their timestamp can no longer pass the max_age check.
+        horizon = 2 * self.max_age if self.max_age is not None else float("inf")
+        while self._seen:
+            oldest_id, seen_at = next(iter(self._seen.items()))
+            if now - seen_at > horizon or len(self._seen) > self._dedupe_limit:
+                self._seen.pop(oldest_id)
+            else:
+                break
+
+    async def accept(self, headers: Mapping[str, str], body: bytes) -> WebhookEvent | None:
+        """Verify and parse a delivery without dispatching it.
+
+        Returns ``None`` for a duplicate. Raises :class:`WebhookVerificationError`
+        for forged, stale or foreign deliveries.
+        """
+        await self.verify(headers, body)
+        event = parse_event(headers, body)
+        self._check_broadcaster(event)
+        if self._seen_before(event.message_id):
+            log.debug("dropping duplicate delivery %s", event.message_id)
+            return None
+        return event
 
     async def handle(self, headers: Mapping[str, str], body: bytes) -> WebhookEvent | None:
         """Verify, parse and dispatch one delivery.
 
         Returns the event, or ``None`` if it was a duplicate. Raises
-        :class:`WebhookVerificationError` for forged or stale requests: answer
-        those with HTTP 401/403. Exceptions from your handlers propagate.
+        :class:`WebhookVerificationError` for forged, stale or foreign
+        requests: answer those with HTTP 401. Exceptions from your handlers
+        propagate, and the delivery is not marked as seen, so Kick's retry
+        gets another chance.
         """
-        await self.verify(headers, body)
-        event = parse_event(headers, body)
-        if self._is_duplicate(event.message_id):
-            log.debug("dropping duplicate delivery %s", event.message_id)
+        event = await self.accept(headers, body)
+        if event is None:
             return None
         await self.dispatch(event)
+        self._remember(event.message_id)
         return event
 
     async def dispatch(self, event: WebhookEvent) -> None:
@@ -302,17 +382,20 @@ class WebhookHandler:
     # aiohttp integration --------------------------------------------------
 
     async def aiohttp_handler(self, request: web.Request) -> web.Response:
-        """An aiohttp request handler. Answers 200 quickly; handler errors are logged."""
+        """An aiohttp request handler. Answers quickly; handler errors are logged."""
         from aiohttp import web
 
         body = await request.read()
         try:
-            await self.verify(request.headers, body)
-            event = parse_event(request.headers, body)
+            event = await self.accept(request.headers, body)
         except WebhookVerificationError as exc:
             log.warning("rejected webhook from %s: %s", request.remote, exc)
-            return web.Response(status=401, text="invalid signature")
-        if not self._is_duplicate(event.message_id):
+            return web.Response(status=401, text="rejected")
+        except Exception:
+            log.exception("could not verify webhook (public key unavailable?)")
+            return web.Response(status=503, text="try again")
+        if event is not None:
+            self._remember(event.message_id)
             task = asyncio.create_task(self._safe_dispatch(event))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -335,3 +418,9 @@ class WebhookHandler:
     def __repr__(self) -> str:
         n = sum(len(v) for v in self._handlers.values()) + len(self._catch_all)
         return f"<WebhookHandler handlers={n}>"
+
+
+def _check(key: rsa.RSAPublicKey, message_id: str, timestamp: str, body: bytes, sig: str) -> bool:
+    return verify_signature(
+        key, message_id=message_id, timestamp=timestamp, body=body, signature=sig
+    )
