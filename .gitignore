@@ -1,84 +1,28 @@
-# Python build artifacts
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-*.egg
-.installed.cfg
-MANIFEST.in
-
-# Project specific
-kick_tokens.db
-*.db
-.env
-
-# Virtual environment
-.env/
+build/
+dist/
 .venv/
-env/
 venv/
-ENV/
 
-# IDE files
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets and local state: never commit tokens
+.env
+*.db
+kick_tokens.*
+tokens.json
+
+# Editors / OS
 .idea/
 .vscode/
 *.swp
-*.swo
 .DS_Store
-
-# Testing
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
-
-# Documentation
-docs/_build/
-docs/site/
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-pyproject.toml
-
-# Additional entries
-htmlcov/
-.mypy_cache/

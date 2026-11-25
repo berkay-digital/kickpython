@@ -1,0 +1,90 @@
+[project]
+name = "kickpython"
+dynamic = ["version"]
+description = "Async Python client for the official Kick.com API: OAuth 2.1, chat, channels, moderation, rewards, webhooks and live chat."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "berkay.digital", email = "contact@berkay.digital" }]
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.10",
+    "cryptography>=42",
+    "pydantic>=2.7",
+]
+keywords = ["kick", "kick.com", "api", "oauth", "chat", "bot", "webhooks", "streaming", "asyncio"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+# Only used by the unofficial live chat listener, as a fallback when Cloudflare
+# blocks plain requests to kick.com's internal channel endpoint.
+cloudflare = ["curl_cffi>=0.7"]
+
+[project.urls]
+Homepage = "https://github.com/berkay-digital/kickpython"
+Source = "https://github.com/berkay-digital/kickpython"
+Issues = "https://github.com/berkay-digital/kickpython/issues"
+Changelog = "https://github.com/berkay-digital/kickpython/blob/main/CHANGELOG.md"
+"Kick API docs" = "https://docs.kick.com"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8",
+    "pytest-aiohttp>=1.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/kickpython/_version.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["live: hits the real Kick API (needs KICK_* env vars)"]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "RUF", "PT"]
+ignore = [
+    "RUF012",  # pydantic copies mutable defaults per instance
+    "PT018",   # compound asserts are fine in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PT011"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["kickpython"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
