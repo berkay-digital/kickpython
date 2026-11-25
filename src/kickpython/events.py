@@ -11,9 +11,11 @@ from .models import KickModel, OptionalDatetime, OptionalStr
 from .scopes import EventType
 
 __all__ = [
+    "DROPS_REWARD_CLAIMED",
     "Badge",
     "ChannelFollowed",
     "ChatMessage",
+    "DropsRewardClaimed",
     "EventPayload",
     "EventUser",
     "Identity",
@@ -221,6 +223,24 @@ class KicksGifted(EventPayload):
     created_at: OptionalDatetime = None
 
 
+class DropsRewardClaimed(EventPayload):
+    """A viewer claimed a Drops reward (organizations only).
+
+    Kick sends this to the organization's webhook URL without a
+    ``Kick-Event-Type`` header; kickpython labels it ``DROPS_REWARD_CLAIMED``.
+    Fulfil it idempotently: Kick may deliver the same ``claim_id`` again.
+    """
+
+    claim_id: str
+    user_id: int
+    campaign_id: str
+    reward_id: str
+    external_id: OptionalStr = None
+
+
+DROPS_REWARD_CLAIMED = "drops.reward.claimed"
+"""kickpython's name for Drops claim webhooks, which carry no event type header."""
+
 _PAYLOADS: dict[str, type[EventPayload]] = {
     EventType.CHAT_MESSAGE_SENT.value: ChatMessage,
     EventType.CHANNEL_FOLLOWED.value: ChannelFollowed,
@@ -232,6 +252,7 @@ _PAYLOADS: dict[str, type[EventPayload]] = {
     EventType.LIVESTREAM_METADATA_UPDATED.value: LivestreamMetadataUpdated,
     EventType.MODERATION_BANNED.value: ModerationBanned,
     EventType.KICKS_GIFTED.value: KicksGifted,
+    DROPS_REWARD_CLAIMED: DropsRewardClaimed,
 }
 
 

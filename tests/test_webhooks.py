@@ -300,3 +300,75 @@ async def test_failed_key_fetch_fails_fast() -> None:
         with pytest.raises(WebhookKeyUnavailable):
             await hook.handle(headers, body)
     assert calls[0] == 1
+
+
+CLAIM = {
+    "claim_id": "01CLAIM",
+    "user_id": 42,
+    "campaign_id": "01CAMP",
+    "reward_id": "01REW",
+    "external_id": "sword-1",
+}
+
+
+def drops_signed(
+    payload: dict[str, Any], message_id: str = "01DROP"
+) -> tuple[dict[str, str], bytes]:
+    headers, body = signed("unused", payload, message_id=message_id)
+    # Drops claim webhooks: no type/version/subscription headers, and a different timestamp name.
+    return {
+        "Kick-Event-Signature": headers["Kick-Event-Signature"],
+        "Kick-Event-Message-ID": headers["Kick-Event-Message-Id"],
+        "Kick-Event-Timestamp": headers["Kick-Event-Message-Timestamp"],
+    }, body
+
+
+async def test_drops_claim_webhook() -> None:
+    from kickpython import DROPS_REWARD_CLAIMED, DropsRewardClaimed
+
+    hook = WebhookHandler(PEM, broadcaster_user_ids=[123])  # allowlist must not block drops
+    got: list[WebhookEvent] = []
+
+    @hook.on(DROPS_REWARD_CLAIMED)
+    def on_claim(event: WebhookEvent) -> None:
+        got.append(event)
+
+    headers, body = drops_signed(CLAIM)
+    event = await hook.handle(headers, body)
+    assert event is not None and event.type == DROPS_REWARD_CLAIMED
+    claim = event.payload
+    assert isinstance(claim, DropsRewardClaimed)
+    assert (claim.claim_id, claim.user_id, claim.external_id) == ("01CLAIM", 42, "sword-1")
+    assert event.timestamp is not None and got == [event]
+
+
+async def test_untyped_non_drops_body_is_rejected() -> None:
+    hook = WebhookHandler(PEM)
+    headers, body = drops_signed({"hello": "world"})
+    with pytest.raises(WebhookVerificationError, match="Kick-Event-Type"):
+        await hook.handle(headers, body)
+
+
+async def test_aiohttp_drops_claim_is_synchronous() -> None:
+    hook = WebhookHandler(PEM)
+    calls: list[str] = []
+
+    @hook.on("drops.reward.claimed")
+    async def fulfil(event: WebhookEvent) -> None:
+        calls.append(event.message_id)
+        if len(calls) == 1:
+            raise RuntimeError("game server down")
+
+    client = TestClient(TestServer(hook.aiohttp_app("/hook")))
+    await client.start_server()
+    try:
+        headers, body = drops_signed(CLAIM)
+        first = await client.post("/hook", data=body, headers=headers)
+        assert first.status == 500  # Kick will retry
+        retry = await client.post("/hook", data=body, headers=headers)
+        assert retry.status == 200
+        again = await client.post("/hook", data=body, headers=headers)
+        assert again.status == 200  # idempotent: already fulfilled, not run again
+        assert len(calls) == 2
+    finally:
+        await client.close()

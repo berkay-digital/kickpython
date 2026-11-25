@@ -5,7 +5,7 @@ Async Python client for the [Kick.com public API](https://docs.kick.com).
 - OAuth 2.1 with PKCE, app tokens and user tokens. Tokens refresh on their own and persist in memory, a JSON file, SQLite or your own store.
 - Every endpoint in Kick's API: users, channels, chat, moderation, channel rewards, livestreams, categories, event subscriptions, KICKs, ads and drops.
 - Typed responses (pydantic models), cursor pagination, automatic retries on rate limits.
-- Webhook receiver with signature checks, replay protection and typed event payloads.
+- Webhook receiver with signature checks, replay protection and typed event payloads, including Drops reward claims.
 - A websocket chat reader for bots that can't expose a public webhook URL (unofficial, see below).
 
 ```bash

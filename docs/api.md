@@ -97,6 +97,8 @@ Name and tag filters match on substrings: `names=["just"]` finds "Just Chatting"
 | `drops.claims(campaign_id=, user_id=, claim_id=, external_status=, limit=, cursor=)` returns `Page[DropsClaim]` | `GET /public/v1/drops/claims` | App token of an organization app |
 | `drops.update_claims({claim_id: status})` | `PATCH /public/v1/drops/claims` | same |
 
+Drops endpoints only work for apps registered to an [organization](https://docs.kick.com/organizations/organization-management). For any other app Kick answers `500 Internal server error`, which kickpython raises as `ServerError`. Claim webhooks are covered in [webhooks.md](webhooks.md#drops-claims).
+
 Ad break errors carry Kick's reason in `exc.data`, for example `CHANNEL_IS_NOT_LIVE` or `MAX_AD_BREAKS_REACHED`.
 
 ## OAuth and keys

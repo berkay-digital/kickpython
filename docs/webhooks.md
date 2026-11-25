@@ -99,6 +99,37 @@ An event type this version of kickpython doesn't know still reaches your handler
 
 Anonymous gifters arrive with `is_anonymous=True` and every other user field set to `None`.
 
+## Drops claims
+
+If your organization runs [Drops campaigns](https://docs.kick.com/drops/drops-guide), Kick posts each claimed reward to the webhook URL you gave Kick when registering the organization. These requests differ from event webhooks. They have no `Kick-Event-Type` header and send the timestamp as `Kick-Event-Timestamp`, and Kick expects a synchronous answer: 200 only once the reward is delivered.
+
+The same `WebhookHandler` takes them. kickpython labels them `DROPS_REWARD_CLAIMED`:
+
+```python
+from kickpython import DROPS_REWARD_CLAIMED, DropsRewardClaimed, WebhookEvent, WebhookHandler
+
+hook = WebhookHandler()
+
+@hook.on(DROPS_REWARD_CLAIMED)
+async def fulfil(event: WebhookEvent):
+    claim: DropsRewardClaimed = event.payload
+    await give_item(kick_user_id=claim.user_id, reward=claim.external_id or claim.reward_id,
+                    idempotency_key=claim.claim_id)
+```
+
+The aiohttp route runs Drops handlers before answering. It returns 200 when they succeed and 500 when one raises, so Kick tries again. A copy that arrives while the first is still running gets 503. Make fulfilment idempotent on `claim_id`: Kick can deliver the same claim twice, and the handler's duplicate memory lives in one process only.
+
+The `broadcaster_user_ids` filter doesn't apply to Drops claims, since they belong to the organization rather than a channel.
+
+To catch up on claims you missed, or to record your fulfilment status at Kick, use the claims API:
+
+```python
+page = await kick.drops.claims(campaign_id="01J...", limit=100)
+await kick.drops.update_claims({c.claim_id: "processed" for c in page})
+```
+
+kickpython verifies Drops signatures the same way as other webhooks, over `"{message id}.{timestamp}.{body}"` with Kick's public key. Kick's Drops guide doesn't spell out the signed string separately, and this path hasn't been tested against real Drops deliveries, because those need an approved organization.
+
 ## Verifying by hand
 
 ```python
