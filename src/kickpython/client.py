@@ -13,7 +13,7 @@ import aiohttp
 from pydantic import BaseModel, TypeAdapter
 
 from ._http import DEFAULT_API_BASE, DEFAULT_OAUTH_BASE, AuthMode, Params, Transport
-from .errors import MissingTokenError, OAuthError
+from .errors import KickAPIError, MissingTokenError, OAuthError
 from .models import (
     AdBreak,
     AdBreakStatus,
@@ -254,8 +254,11 @@ class KickClient:
         """Exchange the ``code`` from the OAuth callback for a user token.
 
         The returned token has ``user_id`` filled in, and is saved in the
-        token store unless ``store=False``. Look the user ID up requires the
-        ``user:read`` or ``channel:read`` scope.
+        token store unless ``store=False``. Finding the user ID needs the
+        ``user:read`` or ``channel:read`` scope. Without either, a
+        :class:`MissingTokenError` is raised with the unsaved token on
+        ``exc.token`` (with ``store=False`` the token is returned with
+        ``user_id=None`` instead).
         """
         client_id, secret = self._http.require_credentials()
         data = await self._http.oauth_post(
@@ -270,7 +273,13 @@ class KickClient:
             },
         )
         token = Token.from_oauth_response(data)
-        token = token.with_user(await self._lookup_user_id(token))
+        try:
+            token = token.with_user(await self._lookup_user_id(token))
+        except MissingTokenError as exc:
+            if not store:
+                return token
+            exc.token = token  # type: ignore[attr-defined]
+            raise
         if store:
             await self._http.store.set(token)
         return token
@@ -289,14 +298,19 @@ class KickClient:
             api_base=self._http.api_base,
             user_agent=self._http.user_agent,
         )
-        if not token.scopes or token.has_scopes(Scope.USER_READ):
-            users = await temp.users.get()
-            if users:
-                return users[0].user_id
-        if not token.scopes or token.has_scopes(Scope.CHANNEL_READ):
-            channels = await temp.channels.get()
-            if channels:
-                return channels[0].broadcaster_user_id
+        unknown = not token.scopes
+        if unknown or token.has_scopes(Scope.USER_READ):
+            try:
+                return (await temp.users.me()).user_id
+            except (KickAPIError, MissingTokenError):
+                if not unknown:
+                    raise
+        if unknown or token.has_scopes(Scope.CHANNEL_READ):
+            try:
+                return (await temp.channels.me()).broadcaster_user_id
+            except (KickAPIError, MissingTokenError):
+                if not unknown:
+                    raise
         raise MissingTokenError(
             "can't tell which user this token belongs to: request the user:read scope"
         )
@@ -306,7 +320,9 @@ class KickClient:
         uid = self._require_user_id(user_id, "user_id")
         return await self._http.user_token(uid, force=True)
 
-    async def refresh_all_user_tokens(self) -> dict[int, Token | Exception]:
+    async def refresh_all_user_tokens(
+        self, *, concurrency: int = 5
+    ) -> dict[int, Token | Exception]:
         """Refresh every stored user token.
 
         Kick refresh tokens expire after a period of inactivity (the window
@@ -314,9 +330,13 @@ class KickClient:
         Failures are returned, not raised.
         """
         ids = await self._http.store.user_ids()
-        results = await asyncio.gather(
-            *(self._http.user_token(uid, force=True) for uid in ids), return_exceptions=True
-        )
+        limit = asyncio.Semaphore(concurrency)
+
+        async def one(uid: int) -> Token:
+            async with limit:
+                return await self._http.user_token(uid, force=True)
+
+        results = await asyncio.gather(*(one(uid) for uid in ids), return_exceptions=True)
         out: dict[int, Token | Exception] = {}
         for uid, res in zip(ids, results, strict=True):
             if isinstance(res, BaseException) and not isinstance(res, Exception):
@@ -392,9 +412,9 @@ class _Resource:
 class UsersAPI(_Resource):
     async def get(self, ids: Iterable[int | str] | int | None = None) -> list[User]:
         """Users by ID. With no IDs, the authorized user (needs a user token)."""
-        id_list = _ids(ids)
-        if not id_list:
-            return _parse_list(User, _data(await self._req("GET", "/public/v1/users")))
+        if ids is None:
+            return [await self.me()]
+        id_list = _ids(ids) or []
         out: list[User] = []
         for chunk in _chunks(id_list, 50):
             body = await self._req("GET", "/public/v1/users", params={"id": list(chunk)})
@@ -422,13 +442,15 @@ class ChannelsAPI(_Resource):
         With neither, returns the authorized user's channel. Requests over the
         API's 50 item limit are split for you.
         """
-        id_list, slug_list = _ids(user_ids), _strs(slugs)
-        if id_list and slug_list:
+        if user_ids is not None and slugs is not None:
             raise ValueError("pass user_ids or slugs, not both")
-        if not id_list and not slug_list:
-            return _parse_list(Channel, _data(await self._req("GET", "/public/v1/channels")))
-        key, values = ("broadcaster_user_id", id_list) if id_list else ("slug", slug_list)
-        assert values is not None
+        if user_ids is None and slugs is None:
+            return [await self.me()]
+        values: list[Any]
+        if user_ids is not None:
+            key, values = "broadcaster_user_id", _ids(user_ids) or []
+        else:
+            key, values = "slug", _strs(slugs) or []
         out: list[Channel] = []
         for chunk in _chunks(values, 50):
             body = await self._req("GET", "/public/v1/channels", params={key: list(chunk)})
@@ -652,20 +674,24 @@ class RewardsAPI(_Resource):
         )
 
         async def fetch(next_cursor: str) -> Page[RewardRedemptions]:
-            return await self.redemptions(reward_id=reward_id, status=status, cursor=next_cursor)
+            return await self.redemptions(
+                reward_id=reward_id, status=status, ids=id_list, cursor=next_cursor
+            )
 
         return _page(RewardRedemptions, body, fetch)
 
-    async def accept(self, ids: Iterable[str]) -> builtins.list[FailedRedemption]:
+    async def accept(self, ids: Iterable[str] | str) -> builtins.list[FailedRedemption]:
         """Accept pending redemptions (25 per call). Returns the ones that failed."""
         return await self._resolve("accept", ids)
 
-    async def reject(self, ids: Iterable[str]) -> builtins.list[FailedRedemption]:
+    async def reject(self, ids: Iterable[str] | str) -> builtins.list[FailedRedemption]:
         """Reject pending redemptions (25 per call). Returns the ones that failed."""
         return await self._resolve("reject", ids)
 
-    async def _resolve(self, action: str, ids: Iterable[str]) -> builtins.list[FailedRedemption]:
-        unique = list(dict.fromkeys(str(i) for i in ids))
+    async def _resolve(
+        self, action: str, ids: Iterable[str] | str
+    ) -> builtins.list[FailedRedemption]:
+        unique = list(dict.fromkeys(_strs(ids) or []))
         failed: builtins.list[FailedRedemption] = []
         for chunk in _chunks(unique, 25):
             body = await self._req(
@@ -778,8 +804,8 @@ class EventsAPI(_Resource):
         required; with a user token Kick uses the token's user. Check
         ``result.ok`` on each entry: Kick reports per-event errors in the body.
         """
-        if isinstance(events, (str, EventType, tuple)):
-            events = [events]
+        if isinstance(events, (str, EventType)) or _is_event_spec_tuple(events):
+            events = [events]  # type: ignore[list-item]
         payload: builtins.list[dict[str, Any]] = []
         for ev in events:
             name, version = ev if isinstance(ev, tuple) else (ev, 1)
@@ -883,6 +909,16 @@ class DropsAPI(_Resource):
             await self._req(
                 "PATCH", "/public/v1/drops/claims", auth="app", json={"claims": list(chunk)}
             )
+
+
+def _is_event_spec_tuple(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], (str, EventType))
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+    )
 
 
 def _seg(value: str) -> str:

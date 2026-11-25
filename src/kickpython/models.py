@@ -9,9 +9,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Annotated, Any, Generic, Literal, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict
+from pydantic import BaseModel, BeforeValidator, ConfigDict, model_validator
 
 __all__ = [
     "AdBreak",
@@ -60,6 +60,22 @@ OptionalStr = Annotated[str | None, BeforeValidator(_empty_to_none)]
 
 class KickModel(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_lists(cls, data: Any) -> Any:
+        # Kick's Go backend sends nil slices as null; treat them as empty lists.
+        if isinstance(data, dict):
+            nulls = [
+                k
+                for k, v in data.items()
+                if v is None
+                and k in cls.model_fields
+                and get_origin(cls.model_fields[k].annotation) is list
+            ]
+            if nulls:
+                data = {k: v for k, v in data.items() if k not in nulls}
+        return data
 
 
 # Users and channels ---------------------------------------------------------

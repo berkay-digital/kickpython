@@ -169,3 +169,36 @@ async def test_resolve_channel() -> None:
     finally:
         await live._close_session()
         await server.close()
+
+
+def _dead_url() -> str:
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return f"ws://127.0.0.1:{port}/ws"
+
+
+async def test_reconnect_false_raises() -> None:
+    live = LiveChat(ws_url=_dead_url(), reconnect=False)
+    with pytest.raises(RealtimeError):
+        await live.run()
+
+
+async def test_stop_interrupts_backoff_and_ends_messages() -> None:
+    live = LiveChat(ws_url=_dead_url(), max_backoff=60)
+    received: list[LiveChatMessage] = []
+
+    async def consume() -> None:
+        async for msg in live.messages():
+            received.append(msg)
+
+    consumer = asyncio.create_task(consume())
+    runner = asyncio.create_task(live.run())
+    await asyncio.sleep(0.3)  # first connect fails, now sleeping in backoff
+    await live.stop()
+    await asyncio.wait_for(runner, 2)
+    await asyncio.wait_for(consumer, 2)
+    assert received == []

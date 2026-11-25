@@ -516,3 +516,94 @@ async def test_revoke_user_keeps_token_when_kick_fails(fake: FakeKick, client: K
     fake.on("POST", "/oauth/revoke", (400, {"error": "invalid token"}))
     await client.revoke_user(7)
     assert await client.token_store.get(7) is None
+
+
+async def test_explicit_empty_lists_send_nothing(fake: FakeKick, client: KickClient) -> None:
+    await store_user(client)
+    me = client.as_user(7)
+    assert await me.users.get([]) == []
+    assert await me.channels.get(user_ids=[]) == []
+    assert await me.channels.get(slugs=[]) == []
+    assert fake.calls("GET", "/public/v1/users") == []
+    assert fake.calls("GET", "/public/v1/channels") == []
+    with pytest.raises(MissingTokenError):
+        await client.users.get()  # "the authorized user" needs a user token
+
+
+async def test_subscribe_accepts_tuple_of_events(fake: FakeKick, client: KickClient) -> None:
+    fake.on("POST", "/public/v1/events/subscriptions", ok([]))
+    await client.events.subscribe(
+        (EventType.CHAT_MESSAGE_SENT, EventType.CHANNEL_FOLLOWED), broadcaster_user_id=1
+    )
+    await client.events.subscribe(("kicks.gifted", 1), broadcaster_user_id=1)
+    bodies = [c.json["events"] for c in fake.calls("POST", "/public/v1/events/subscriptions")]
+    assert [e["name"] for e in bodies[0]] == ["chat.message.sent", "channel.followed"]
+    assert bodies[1] == [{"name": "kicks.gifted", "version": 1}]
+
+
+async def test_redemption_pages_keep_id_filter(fake: FakeKick, client: KickClient) -> None:
+    await store_user(client)
+    fake.on(
+        "GET",
+        "/public/v1/channels/rewards/redemptions",
+        ok([], pagination={"next_cursor": "c2"}),
+        ok([], pagination={"next_cursor": ""}),
+    )
+    page = await client.as_user(7).rewards.redemptions(ids=["a", "b"])
+    await page.next()
+    second = fake.calls("GET", "/public/v1/channels/rewards/redemptions")[1].query
+    assert ("id", "a") in second and ("cursor", "c2") in second
+    fake.on("POST", "/public/v1/channels/rewards/redemptions/reject", ok([]))
+    await client.as_user(7).rewards.reject("01KEWZ2RKYZZFGD154K50Y3F8D")
+    body = fake.calls("POST", "/public/v1/channels/rewards/redemptions/reject")[0].json
+    assert body == {"ids": ["01KEWZ2RKYZZFGD154K50Y3F8D"]}
+
+
+async def test_exchange_code_without_identity_scope_keeps_token(
+    fake: FakeKick, client: KickClient
+) -> None:
+    fake.on(
+        "POST",
+        "/oauth/token",
+        (
+            200,
+            {"access_token": "u", "refresh_token": "r", "expires_in": 7200, "scope": "chat:write"},
+        ),
+    )
+    with pytest.raises(MissingTokenError) as info:
+        await client.exchange_code("c", code_verifier="v", redirect_uri="http://x")
+    assert info.value.token.access_token == "u"  # type: ignore[attr-defined]
+    tok = await client.exchange_code("c", code_verifier="v", redirect_uri="http://x", store=False)
+    assert tok.user_id is None and tok.refresh_token == "r"
+
+
+async def test_bad_token_response_is_an_oauth_error(fake: FakeKick, client: KickClient) -> None:
+    from kickpython import OAuthError
+
+    fake.on("POST", "/oauth/token", (200, ""))
+    with pytest.raises(OAuthError, match="unexpected token response"):
+        await client.get_app_token()
+
+
+async def test_null_lists_become_empty(fake: FakeKick, client: KickClient) -> None:
+    fake.on(
+        "GET",
+        "/public/v2/categories",
+        ok([{"id": 1, "name": "x", "thumbnail": "", "tags": None}], pagination={"next_cursor": ""}),
+    )
+    cat = await client.categories.get(1)
+    assert cat is not None and cat.tags == []
+
+
+async def test_retry_after_http_date(fake: FakeKick, client: KickClient) -> None:
+    from datetime import datetime, timezone
+    from email.utils import format_datetime
+
+    past = format_datetime(datetime(2020, 1, 1, tzinfo=timezone.utc), usegmt=True)
+    fake.on(
+        "GET",
+        "/public/v1/livestreams/stats",
+        (429, {"message": "slow"}, {"Retry-After": past}),
+        ok({"total_count": 2}),
+    )
+    assert (await client.livestreams.stats()).total_count == 2

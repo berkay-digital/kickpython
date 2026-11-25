@@ -171,3 +171,26 @@ async def test_sqlite_store_is_private_and_handles_unknown_expiry(tmp_path: Path
     assert path.stat().st_mode & 0o777 == 0o600
     tok = await store.get(1)
     assert tok is not None and tok.expires_at is None and not tok.is_expired()
+
+
+def test_single_scope_string_is_not_split_into_letters() -> None:
+    req = build_authorization_url(client_id="c", redirect_uri="http://x", scopes=Scope.USER_READ)
+    assert req.scopes == ("user:read",)
+    req = build_authorization_url(
+        client_id="c", redirect_uri="http://x", scopes="user:read chat:write"
+    )
+    assert req.scopes == ("user:read", "chat:write")
+
+
+async def test_sqlite_memory_store() -> None:
+    store = SQLiteTokenStore(":memory:")
+    await store.set(Token("a", refresh_token="r", user_id=1, expires_at=2e9))
+    got = await store.get(1)
+    assert got is not None and got.access_token == "a"
+    assert await store.user_ids() == [1]
+
+
+async def test_sqlite_store_creates_parent_dirs(tmp_path: Path) -> None:
+    store = SQLiteTokenStore(tmp_path / "nested" / "dir" / "t.db")
+    await store.set(Token("a", refresh_token="r", user_id=1))
+    assert (tmp_path / "nested" / "dir" / "t.db").exists()

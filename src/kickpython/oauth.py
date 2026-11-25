@@ -59,6 +59,8 @@ def build_authorization_url(
     oauth_base: str = DEFAULT_OAUTH_BASE,
 ) -> AuthorizationRequest:
     """Build the ``/oauth/authorize`` URL for the authorization code flow with PKCE."""
+    if isinstance(scopes, str):  # also catches a single Scope member
+        scopes = scopes.split()
     scope_list = tuple(dict.fromkeys(str(s) for s in scopes))
     if not scope_list:
         raise ValueError("request at least one scope")

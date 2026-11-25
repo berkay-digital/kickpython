@@ -224,7 +224,11 @@ class LiveChat:
             are fetched from Kick, with a built-in fallback.
         ws_url: Full websocket URL to connect to instead of Pusher (for tests
             or a proxy). Skips the credential lookup.
-        reconnect: Reconnect with backoff when the connection drops.
+        reconnect: Reconnect with backoff when the connection drops. With
+            ``False``, :meth:`run` raises :class:`RealtimeError` instead.
+
+    Handlers run one at a time, in order, in a separate task from the
+    websocket, so a slow handler delays later handlers but not the connection.
     """
 
     channel_info_url = CHANNEL_INFO_URL
@@ -250,10 +254,14 @@ class LiveChat:
         self._channels: dict[int, ChannelRef] = {}  # chatroom_id -> ref
         self._ws: aiohttp.ClientWebSocketResponse[bool] | None = None
         self._stopping = False
+        self._stop_event = asyncio.Event()
         self._connected = asyncio.Event()
         self._message_handlers: list[Callable[[LiveChatMessage], Any]] = []
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
-        self._queues: set[asyncio.Queue[LiveChatMessage]] = set()
+        self._queues: set[asyncio.Queue[LiveChatMessage | None]] = set()
+        # Frames wait here for the dispatch worker, so slow handlers never
+        # hold up pings or the receive loop.
+        self._inbox: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=10_000)
         self._client_id = str(uuid.uuid4())
 
     # Handlers -------------------------------------------------------------
@@ -280,12 +288,18 @@ class LiveChat:
         return register
 
     async def messages(self) -> AsyncIterator[LiveChatMessage]:
-        """Iterate over incoming messages (call :meth:`run` in another task)."""
-        queue: asyncio.Queue[LiveChatMessage] = asyncio.Queue(maxsize=10_000)
+        """Iterate over incoming messages (call :meth:`run` in another task).
+
+        The iteration ends when :meth:`run` returns.
+        """
+        queue: asyncio.Queue[LiveChatMessage | None] = asyncio.Queue(maxsize=10_000)
         self._queues.add(queue)
         try:
             while True:
-                yield await queue.get()
+                msg = await queue.get()
+                if msg is None:
+                    return
+                yield msg
         finally:
             self._queues.discard(queue)
 
@@ -294,8 +308,9 @@ class LiveChat:
     @property
     def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            if not self._owns_session:
+                raise RuntimeError("the aiohttp session passed to LiveChat is closed")
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
-            self._owns_session = True
         return self._session
 
     @property
@@ -310,7 +325,10 @@ class LiveChat:
         data: Any = None
         async with self.session.get(url, headers=headers) as resp:
             if resp.status == 200:
-                data = await resp.json(content_type=None)
+                try:
+                    data = await resp.json(content_type=None)
+                except ValueError as exc:
+                    raise RealtimeError(f"kick.com sent a non-JSON answer for {slug!r}") from exc
             elif resp.status == 404:
                 raise RealtimeError(f"no Kick channel called {slug!r}")
             elif resp.status in (403, 429, 503):
@@ -345,7 +363,8 @@ class LiveChat:
         """Start receiving a channel's chat. Accepts a slug or a :class:`ChannelRef`."""
         ref = channel if isinstance(channel, ChannelRef) else await self.resolve(channel)
         self._channels[ref.chatroom_id] = ref
-        if self._ws is not None and not self._ws.closed:
+        # Before the handshake, the connection subscribes every joined channel itself.
+        if self._connected.is_set():
             await self._subscribe(ref)
         log.info("joined chat of %s (chatroom %s)", ref.slug, ref.chatroom_id)
         return ref
@@ -355,7 +374,7 @@ class LiveChat:
         if ref is None:
             return
         self._channels.pop(ref.chatroom_id, None)
-        if self._ws is not None and not self._ws.closed:
+        if self._connected.is_set():
             for name in self._pusher_channels(ref):
                 await self._send("pusher:unsubscribe", {"channel": name})
 
@@ -410,6 +429,8 @@ class LiveChat:
     async def run(self) -> None:
         """Connect and dispatch events until :meth:`stop` is called."""
         self._stopping = False
+        self._stop_event.clear()
+        worker = asyncio.create_task(self._dispatch_worker())
         backoff = 1.0
         try:
             while not self._stopping:
@@ -421,6 +442,7 @@ class LiveChat:
                         f"wss://ws-{cluster}.pusher.com/app/{key}"
                         f"?protocol=7&client=js&version=8.4.0&flash=false"
                     )
+                error: BaseException | None = None
                 try:
                     clean = await self._run_once(url)
                     if clean:
@@ -428,22 +450,51 @@ class LiveChat:
                 except _FatalPusherError as exc:
                     if self._key:  # user-supplied key: nothing else to try
                         raise RealtimeError(str(exc)) from exc
+                    error = exc
                     log.warning("Pusher refused the connection (%s); refetching credentials", exc)
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    error = exc
                     log.warning("live chat connection failed: %s", exc)
-                except Exception:
-                    log.exception("unexpected error in live chat connection; reconnecting")
+                except Exception as exc:
+                    error = exc
+                    log.exception("unexpected error in live chat connection")
                 finally:
                     self._connected.clear()
                     self._ws = None
-                if self._stopping or not self.reconnect:
+                if self._stopping:
+                    break
+                if not self.reconnect:
+                    if error is not None:
+                        raise RealtimeError(f"live chat connection failed: {error}") from error
                     break
                 delay = min(self.max_backoff, backoff) + random.uniform(0, 1)
                 log.info("reconnecting to live chat in %.1fs", delay)
-                await asyncio.sleep(delay)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stop_event.wait(), delay)
                 backoff = min(self.max_backoff, backoff * 2)
         finally:
+            with contextlib.suppress(asyncio.QueueFull):
+                self._inbox.put_nowait(None)
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                worker.cancel()
+            for queue in list(self._queues):
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(None)
             await self._close_session()
+
+    async def _dispatch_worker(self) -> None:
+        while True:
+            frame = await self._inbox.get()
+            if frame is None:
+                return
+            if self._stopping:
+                continue  # drop what's left after stop()
+            try:
+                await self._dispatch(frame)
+            except Exception:
+                log.exception("live chat dispatch failed")
 
     async def _run_once(self, url: str) -> bool:
         """One connection. Returns True if it was established before ending."""
@@ -453,7 +504,7 @@ class LiveChat:
             timeout = 120.0
             while not self._stopping:
                 try:
-                    msg = await ws.receive(timeout=timeout + 30 if established else 15)
+                    msg = await ws.receive(timeout=timeout if established else 15)
                 except asyncio.TimeoutError:
                     if not established:
                         raise
@@ -507,7 +558,10 @@ class LiveChat:
                         raise _FatalPusherError(f"{code} {err.get('message')}")
                     log.warning("Pusher error: %s", err)
                 elif not event.startswith("pusher"):
-                    await self._dispatch(frame)
+                    try:
+                        self._inbox.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        log.warning("live chat handlers are too slow; dropping %s", event)
         return established
 
     async def _dispatch(self, frame: dict[str, Any]) -> None:
@@ -522,7 +576,7 @@ class LiveChat:
         try:
             if event == EV_MESSAGE:
                 msg = LiveChatMessage.model_validate({**data, "channel": ref})
-                for queue in self._queues:
+                for queue in list(self._queues):
                     with contextlib.suppress(asyncio.QueueFull):
                         queue.put_nowait(msg)
                 for func in self._message_handlers:
@@ -545,6 +599,7 @@ class LiveChat:
     async def stop(self) -> None:
         """Disconnect and make :meth:`run` return."""
         self._stopping = True
+        self._stop_event.set()
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
 

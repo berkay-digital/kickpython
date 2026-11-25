@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import json as jsonlib
 import logging
 import random
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import aiohttp
@@ -268,10 +270,14 @@ class Transport:
         """Return (access token, kind) where kind is static/user/app/none."""
         if auth == "none":
             return None, "none"
+        if auth in ("user", "any") and user_id is not None:
+            try:
+                return (await self.user_token(user_id)).access_token, "user"
+            except MissingTokenError:
+                if not self.static_token:
+                    raise
         if self.static_token:
             return self.static_token, "static"
-        if auth in ("user", "any") and user_id is not None:
-            return (await self.user_token(user_id)).access_token, "user"
         if auth == "user":
             raise MissingTokenError(
                 "this endpoint needs a user access token: use client.as_user(user_id) "
@@ -340,7 +346,8 @@ class Transport:
 
             wait: float | None = None
             if status == 429:
-                wait = _parse_retry_after(retry_after) or _backoff(attempt + 1)
+                parsed = _parse_retry_after(retry_after)
+                wait = parsed if parsed is not None else _backoff(attempt + 1)
             elif status >= 500 and method == "GET":
                 wait = _backoff(attempt + 1)
             if wait is not None and attempt < self.max_retries and wait <= MAX_RETRY_SLEEP:
@@ -393,7 +400,14 @@ def _parse_retry_after(value: str | None) -> float | None:
     try:
         return max(0.0, float(value))
     except ValueError:
+        pass
+    try:  # RFC 9110 also allows an HTTP date
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
         return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
 def _backoff(attempt: int) -> float:

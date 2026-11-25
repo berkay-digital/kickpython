@@ -14,7 +14,7 @@ import os
 import sqlite3
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -71,6 +71,10 @@ class Token:
     @classmethod
     def from_oauth_response(cls, data: Mapping[str, Any], *, user_id: int | None = None) -> Token:
         """Build a token from the JSON that ``POST /oauth/token`` returns."""
+        if not isinstance(data, Mapping) or not data.get("access_token"):
+            from .errors import OAuthError
+
+            raise OAuthError(f"unexpected token response from Kick: {str(data)[:200]!r}")
         now = time.time()
         expires_in = data.get("expires_in")
         refresh_in = data.get("refresh_expires_in")
@@ -227,12 +231,22 @@ class SQLiteTokenStore:
         self.path = str(path)
         self._lock = asyncio.Lock()
         self._ready = False
+        # An in-memory database only lives as long as its connection.
+        self._memory = (
+            sqlite3.connect(":memory:", check_same_thread=False)
+            if (self.path == ":memory:")
+            else None
+        )
 
     def _connect(self) -> sqlite3.Connection:
-        if not self._ready and self.path != ":memory:" and not os.path.exists(self.path):
-            # Create the file owner-only before SQLite does, so tokens aren't world readable.
-            os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
-        conn = sqlite3.connect(self.path)
+        if self._memory is not None:
+            conn = self._memory
+        else:
+            if not self._ready and not os.path.exists(self.path):
+                Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+                # Create the file owner-only before SQLite does, so tokens aren't world readable.
+                os.close(os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600))
+            conn = sqlite3.connect(self.path)
         if not self._ready:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS tokens (
@@ -250,8 +264,17 @@ class SQLiteTokenStore:
             self._ready = True
         return conn
 
+    @contextlib.contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            if conn is not self._memory:
+                conn.close()
+
     def _get(self, user_id: int) -> Token | None:
-        with contextlib.closing(self._connect()) as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 "SELECT access_token, refresh_token, expires_at, scope, refresh_expires_at "
                 "FROM tokens WHERE channel_id = ?",
@@ -270,7 +293,7 @@ class SQLiteTokenStore:
         )
 
     def _set(self, token: Token) -> None:
-        with contextlib.closing(self._connect()) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO tokens (channel_id, access_token, refresh_token, "
                 "expires_at, scope, refresh_expires_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -286,12 +309,12 @@ class SQLiteTokenStore:
             conn.commit()
 
     def _delete(self, user_id: int) -> None:
-        with contextlib.closing(self._connect()) as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM tokens WHERE channel_id = ?", (str(user_id),))
             conn.commit()
 
     def _ids(self) -> list[int]:
-        with contextlib.closing(self._connect()) as conn:
+        with self._conn() as conn:
             rows = conn.execute("SELECT channel_id FROM tokens").fetchall()
         return [int(r[0]) for r in rows if str(r[0]).isdigit()]
 

@@ -413,7 +413,13 @@ class WebhookHandler:
 
         app = web.Application()
         app.router.add_post(path, self.aiohttp_handler)
+        app.on_cleanup.append(self._drain)
         return app
+
+    async def _drain(self, _app: web.Application | None = None) -> None:
+        """Wait (up to 10 s) for handlers still running from accepted deliveries."""
+        if self._tasks:
+            await asyncio.wait(set(self._tasks), timeout=10)
 
     def __repr__(self) -> str:
         n = sum(len(v) for v in self._handlers.values()) + len(self._catch_all)
