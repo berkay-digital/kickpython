@@ -20,7 +20,7 @@ Methods that take a list of IDs or slugs split it into several requests when it 
 | `channels.me()` returns `Channel` | same | User |
 | `channels.update(stream_title=, category_id=, custom_tags=)` | `PATCH /public/v1/channels` | User, `channel:write` |
 
-`Channel.category` is `None` when no category is set. `Channel.stream.key` and `.url` are only filled with `streamkey:read`.
+`Channel.category` is `None` when no category is set. `Channel.stream.key` and `.url` are only filled with `streamkey:read`. Kick accepts `custom_tags` on an offline channel, but `Channel.stream.custom_tags` stays empty until the channel goes live.
 
 ## Chat
 
@@ -41,6 +41,8 @@ All need a user token with `moderation:ban`. `broadcaster_user_id` defaults to t
 | `moderation.ban(user_id, broadcaster_user_id=None, reason=None)` | `POST /public/v1/moderation/bans` |
 | `moderation.timeout(user_id, minutes, broadcaster_user_id=None, reason=None)` | same, with `duration` (1 to 10080 minutes) |
 | `moderation.unban(user_id, broadcaster_user_id=None)` | `DELETE /public/v1/moderation/bans` |
+
+Kick answers a bare `400 Invalid request` (raised as `BadRequestError`) when the target can't be moderated: the broadcaster themselves, your app's own bot account, or a user ID that doesn't exist.
 
 ## Channel rewards
 

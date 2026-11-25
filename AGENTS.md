@@ -23,6 +23,7 @@ KICK_CLIENT_ID=... KICK_CLIENT_SECRET=... uv run pytest -m live
 
 - Kick's spec lives at https://api.kick.com/swagger/doc.yaml, the docs at https://github.com/KickEngineering/KickDevDocs. Check both before adding or changing an endpoint, and test the change live. The spec has been wrong before: it says `/public/v2/categories` takes comma-separated lists, but the API only accepts repeated keys.
 - Kick returns 401, not 403, for a valid token that lacks a scope.
+- `POST /moderation/bans` returns a bare 400 for the broadcaster, the app's own bot, or an unknown user. Live-test moderation on a public bot account (for example BotRix) with a 1 minute timeout, then unban.
 - Never log or `repr()` tokens or client secrets.
 - Models subclass `KickModel` (extra fields allowed). Convert Kick's `""` and `0001-01-01T00:00:00Z` to `None` with `OptionalStr` / `OptionalDatetime`.
 - Don't wrap endpoints Kick marks deprecated.
